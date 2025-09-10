@@ -28,104 +28,12 @@ pub fn main() !void {
     var iter = elf_hdr.iterateSectionHeadersBuffer(elf_obj);
     while (try iter.next()) |section_hdr| {
         std.debug.assert(section_hdr.sh_name < string_table.len);
-        const sh_name: []const u8 = if (section_hdr.sh_name != 0)
-            std.mem.sliceTo(string_table[section_hdr.sh_name..], 0)
-        else
-            "null";
 
-        const sh_type = switch (section_hdr.sh_type) {
-            elf.SHT_NULL => "NULL",
-            elf.SHT_PROGBITS => "PROGBITS",
-            elf.SHT_SYMTAB => "SYMTAB",
-            elf.SHT_STRTAB => "STRTAB",
-            elf.SHT_RELA => "RELA",
-            elf.SHT_HASH => "HASH",
-            elf.SHT_DYNAMIC => "DYNAMIC",
-            elf.SHT_NOTE => "NOTE",
-            elf.SHT_NOBITS => "NOBITS",
-            elf.SHT_REL => "REL",
-            elf.SHT_SHLIB => "SHLIB",
-            elf.SHT_DYNSYM => "DYNSYM",
-            elf.SHT_INIT_ARRAY => "INIT_ARRAY",
-            elf.SHT_FINI_ARRAY => "FINI_ARRAY",
-            elf.SHT_PREINIT_ARRAY => "PREINIT_ARRAY",
-            elf.SHT_GROUP => "GROUP",
-            elf.SHT_SYMTAB_SHNDX => "SYMTAB_SHNDX",
-            elf.SHT_LOOS => "LOOS",
-            elf.SHT_LLVM_ADDRSIG => "LLVM_ADDRSIG",
-            elf.SHT_GNU_HASH => "GNU_HASH",
-            elf.SHT_GNU_VERDEF => "GNU_VERDEF",
-            elf.SHT_GNU_VERNEED => "GNU_VERNEED",
-            elf.SHT_GNU_VERSYM => "GNU_VERSYM/SHT_HIOS",
-            // elf.SHT_HIOS => "HIOS",
-            elf.SHT_LOPROC => "LOPROC",
-            elf.SHT_X86_64_UNWIND => "X86_64_UNWIND",
-            elf.SHT_HIPROC => "HIPROC",
-            elf.SHT_LOUSER => "LOUSER",
-            elf.SHT_HIUSER => "HIUSER",
-            else => "unknown",
-        };
-
-        std.debug.print("name: {s: <20}, type: {s: <13}, flags: {f}," ++
-            "addr: 0x{x: <6}, offset: 0x{x: <6}, size: {d: <8}," ++
-            "link: {d: <4}, info: {d: <4}, addralign: {d: <4}," ++
-            "entsize: {d}\n", .{
-            sh_name,
-            sh_type,
-            Flags{ .val = section_hdr.sh_flags, .spacing = 15 },
-            section_hdr.sh_addr,
-            section_hdr.sh_offset,
-            section_hdr.sh_size,
-            section_hdr.sh_link,
-            section_hdr.sh_info,
-            section_hdr.sh_addralign,
-            section_hdr.sh_entsize,
+        std.debug.print("{f}\n", .{
+            DumpSection{ .section = &section_hdr, .string_table = string_table },
         });
     }
 }
-
-const Flags = struct {
-    val: elf.Elf64_Xword,
-    spacing: u8,
-
-    pub fn format(f: Flags, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        var written: u16 = 0;
-        var matched_any: bool = false;
-        inline for ([_]elf.Elf64_Xword{
-            elf.SHF_WRITE,      elf.SHF_ALLOC,
-            elf.SHF_EXECINSTR,  elf.SHF_MERGE,
-            elf.SHF_STRINGS,    elf.SHF_INFO_LINK,
-            elf.SHF_LINK_ORDER, elf.SHF_OS_NONCONFORMING,
-            elf.SHF_GROUP,      elf.SHF_TLS,
-            elf.SHF_COMPRESSED, elf.SHF_MASKOS,
-            elf.SHF_MASKPROC,   elf.SHF_EXCLUDE,
-        }, [_][]const u8{
-            "WRITE",      "ALLOC",
-            "EXEC",       "MERGE",
-            "STRINGS",    "INFO_LINK",
-            "LINK_ORDER", "OS_NONCONFORMING",
-            "GROUP",      "TLS",
-            "COMPRESSED", "MASKOS",
-            "MASKPROC",   "EXCLUDE",
-        }) |flag, name| {
-            if (f.val & flag > 0) {
-                if (matched_any) {
-                    try writer.writeAll("|");
-                    written += 1;
-                }
-                matched_any = true;
-                try writer.writeAll(name);
-                written += name.len;
-            }
-        }
-        if (!matched_any) {
-            // try writer.writeAll("none");
-            try writer.writeByte('0');
-            written += 1;
-        }
-        try writer.splatByteAll(' ', f.spacing -| written);
-    }
-};
 
 fn takeShdr(reader: *std.Io.Reader, elf_header: elf.Header) !elf.Elf64_Shdr {
     if (elf_header.is_64) {
@@ -220,3 +128,94 @@ fn setSectionFlags(sh: *elf.Elf64_Shdr, flags: SectionFlags, is_x86_64: bool) vo
         setSectionType(sh, elf.SHT_PROGBITS);
     }
 }
+
+const DumpSection = struct {
+    section: *const elf.Elf64_Shdr,
+    string_table: []const u8,
+
+    pub fn format(d: DumpSection, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const sh_name: []const u8 = if (d.section.sh_name != 0)
+            std.mem.sliceTo(d.string_table[d.section.sh_name..], 0)
+        else
+            "";
+
+        const sh_type = switch (d.section.sh_type) {
+            elf.SHT_NULL => "NULL",
+            elf.SHT_PROGBITS => "PROGBITS",
+            elf.SHT_SYMTAB => "SYMTAB",
+            elf.SHT_STRTAB => "STRTAB",
+            elf.SHT_RELA => "RELA",
+            elf.SHT_HASH => "HASH",
+            elf.SHT_DYNAMIC => "DYNAMIC",
+            elf.SHT_NOTE => "NOTE",
+            elf.SHT_NOBITS => "NOBITS",
+            elf.SHT_REL => "REL",
+            elf.SHT_SHLIB => "SHLIB",
+            elf.SHT_DYNSYM => "DYNSYM",
+            elf.SHT_INIT_ARRAY => "INIT_ARRAY",
+            elf.SHT_FINI_ARRAY => "FINI_ARRAY",
+            elf.SHT_PREINIT_ARRAY => "PREINIT_ARRAY",
+            elf.SHT_GROUP => "GROUP",
+            elf.SHT_SYMTAB_SHNDX => "SYMTAB_SHNDX",
+            elf.SHT_LOOS => "LOOS",
+            elf.SHT_LLVM_ADDRSIG => "LLVM_ADDRSIG",
+            elf.SHT_GNU_HASH => "GNU_HASH",
+            elf.SHT_GNU_VERDEF => "GNU_VERDEF",
+            elf.SHT_GNU_VERNEED => "GNU_VERNEED",
+            elf.SHT_GNU_VERSYM => "GNU_VERSYM/SHT_HIOS",
+            // elf.SHT_HIOS => "HIOS",
+            elf.SHT_LOPROC => "LOPROC",
+            elf.SHT_X86_64_UNWIND => "X86_64_UNWIND",
+            elf.SHT_HIPROC => "HIPROC",
+            elf.SHT_LOUSER => "LOUSER",
+            elf.SHT_HIUSER => "HIUSER",
+            else => "unknown",
+        };
+
+        try writer.print("name: {s: <20}, type: {s: <13}, ", .{ sh_name, sh_type });
+        {
+            try writer.writeAll("flags: ");
+            var written: u8 = 0;
+            inline for ([_]elf.Elf64_Xword{
+                elf.SHF_WRITE,      elf.SHF_ALLOC,
+                elf.SHF_EXECINSTR,  elf.SHF_MERGE,
+                elf.SHF_STRINGS,    elf.SHF_INFO_LINK,
+                elf.SHF_LINK_ORDER, elf.SHF_OS_NONCONFORMING,
+                elf.SHF_GROUP,      elf.SHF_TLS,
+                elf.SHF_COMPRESSED, elf.SHF_MASKOS,
+                elf.SHF_MASKPROC,   elf.SHF_EXCLUDE,
+            }, [_][]const u8{
+                "WRITE",      "ALLOC",
+                "EXEC",       "MERGE",
+                "STRINGS",    "INFO_LINK",
+                "LINK_ORDER", "OS_NONCONFORMING",
+                "GROUP",      "TLS",
+                "COMPRESSED", "MASKOS",
+                "MASKPROC",   "EXCLUDE",
+            }) |flag, name| {
+                if (d.section.sh_flags & flag > 0) {
+                    if (written > 0) {
+                        try writer.writeByte('|');
+                        written += 1;
+                    }
+                    try writer.writeAll(name);
+                    written += name.len;
+                }
+            }
+
+            try writer.splatByteAll(' ', 15 -| written);
+            try writer.writeAll(", ");
+        }
+
+        try writer.print("addr: 0x{x: <6}, offset: 0x{x: <6}, size: {d: <8}, " ++
+            "link: {d: <4}, info: {d: <4}, addralign: {d: <4}, entsize: {d}", .{
+            d.section.sh_addr,
+            d.section.sh_offset,
+            d.section.sh_size,
+            d.section.sh_link,
+            d.section.sh_info,
+            d.section.sh_addralign,
+            d.section.sh_entsize,
+        });
+    }
+};
