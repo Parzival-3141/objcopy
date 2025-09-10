@@ -147,3 +147,76 @@ fn takeShdr(reader: *std.Io.Reader, elf_header: elf.Header) !elf.Elf64_Shdr {
         .sh_entsize = shdr.sh_entsize,
     };
 }
+
+const SectionFlags = struct {
+    alloc: bool = false,
+    load: bool = false,
+    noload: bool = false,
+    readonly: bool = false,
+    exclude: bool = false,
+    debug: bool = false,
+    code: bool = false,
+    data: bool = false,
+    rom: bool = false,
+    share: bool = false,
+    contents: bool = false,
+    merge: bool = false,
+    strings: bool = false,
+    large: bool = false,
+};
+
+fn setSectionType(sh: *elf.Elf64_Shdr, sh_type: elf.Word) void {
+    // If the section type is changed from SHT_NOBITS,
+    // then the offset might become misaligned.
+    if (sh.sh_type == elf.SHT_NOBITS and sh_type != elf.SHT_NOBITS)
+        sh.sh_offset = std.mem.alignForward(
+            elf.Elf64_Off,
+            sh.sh_offset,
+            @max(sh.sh_addralign, 1),
+        );
+    sh.sh_type = sh_type;
+}
+
+fn setSectionFlags(sh: *elf.Elf64_Shdr, flags: SectionFlags, is_x86_64: bool) void {
+    // For ELF objects, the flags have the following effects:
+    //     alloc = add the SHF_ALLOC flag.
+    //     load = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
+    //     readonly = if this flag is not specified, add the SHF_WRITE flag.
+    //     exclude = add the SHF_EXCLUDE flag.
+    //     code = add the SHF_EXECINSTR flag.
+    //     merge = add the SHF_MERGE flag.
+    //     strings = add the SHF_STRINGS flag.
+    //     contents = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
+    //     large = add the SHF_X86_64_LARGE on x86_64; rejected if the target architecture is not x86_64.
+    var new_flags: elf.Elf64_Xword = 0;
+    if (flags.alloc) new_flags |= elf.SHF_ALLOC;
+    if (!flags.readonly) new_flags |= elf.SHF_WRITE;
+    if (flags.code) new_flags |= elf.SHF_EXECINSTR;
+    if (flags.merge) new_flags |= elf.SHF_MERGE;
+    if (flags.strings) new_flags |= elf.SHF_STRINGS;
+    if (flags.exclude) new_flags |= elf.SHF_EXCLUDE;
+    if (flags.large) {
+        if (!is_x86_64) std.process.fatal(
+            "zig objcopy: 'large' section flag is only supported on x86_64 targets",
+            .{},
+        );
+        new_flags |= elf.SHF_X86_64_LARGE;
+    }
+
+    // LLVM preserves some flags when applying the new ones, including os/arch specific flags.
+    const preserve_mask: elf.Elf64_Xword =
+        (elf.SHF_INFO_LINK | elf.SHF_LINK_ORDER | elf.SHF_GROUP |
+            elf.SHF_TLS | elf.SHF_COMPRESSED | elf.SHF_MASKOS |
+            elf.SHF_MASKPROC)
+        // exclude and large overlap with some preserved flags and need to be masked out
+        & ~(elf.SHF_EXCLUDE | @as(elf.Elf64_Xword, if (is_x86_64) elf.SHF_X86_64_LARGE else 0));
+
+    sh.sh_flags = (sh.sh_flags & preserve_mask) | (new_flags & ~preserve_mask);
+
+    if (sh.sh_type == elf.SHT_NOBITS and (flags.load or flags.contents or
+        // LLVM also promotes non-ALLOC NOBITS sections since they're nonsensical.
+        sh.sh_flags & elf.SHF_ALLOC == 0))
+    {
+        setSectionType(sh, elf.SHT_PROGBITS);
+    }
+}
