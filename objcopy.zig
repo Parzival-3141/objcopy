@@ -1,16 +1,92 @@
 const std = @import("std");
 const elf = std.elf;
 
+const fatal = std.process.fatal;
+
+const help =
+    \\Usage: zig objcopy [options] input output
+    \\
+    \\Options:
+    \\  -h, --help                              Print this help and exit.
+    \\  -O, --output-target <format>            Write the output as the specified format. If unspecified, the output format is assumed to be the same as the input file’s format.
+    \\  --set-section-flags <section>=<flags>   Set flags of <section> to <flags>, represented as a comma separated list. Can be specified multiple times to update multiple sections.
+;
+
 pub fn main() !void {
     var arena_inst: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
     var args = try std.process.argsWithAllocator(arena);
-    const self_path = args.next().?;
-    const file_path = args.next() orelse self_path;
+    _ = args.skip();
 
-    const elf_obj = try std.fs.cwd().readFileAlloc(arena, file_path, 1024 * 1024 * 1024);
+    var opt_output_target: ?std.Target.ObjectFormat = null;
+    var opt_set_section_flags: std.ArrayList(SetSectionFlags) = .empty;
+    var opt_input: ?[]const u8 = null;
+    var opt_output: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            if (opt_input == null)
+                opt_input = arg
+            else if (opt_output == null)
+                opt_output = arg
+            else
+                fatal("unexpected positional argument: '{s}'", .{arg});
+        } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            return std.debug.print("{s}\n", .{help}); // @Todo print to stdout
+        } else if (std.mem.eql(u8, arg, "-O") or std.mem.eql(u8, arg, "--output-target")) {
+            const opt = args.next() orelse fatal("expected another argument after '{s}'", .{arg});
+            opt_output_target =
+                if (strEql(opt, "binary"))
+                    .raw
+                else if (strEql(opt, "coff"))
+                    .coff
+                else if (strEql(opt, "elf"))
+                    .elf
+                else if (strEql(opt, "hex"))
+                    .hex
+                else
+                    fatal("unrecognized object format: {s}", .{opt});
+        } else if (std.mem.eql(u8, arg, "--set-section-flags")) {
+            const opt = args.next() orelse fatal("expected another argument after '{s}'", .{arg});
+            const split = splitOption(opt) orelse fatal("unrecognized argument: '{s}', expected <section>=<flags>", .{opt});
+
+            var flags: SectionFlags = .{};
+            if (split.second.len > 0) {
+                var iter = std.mem.splitScalar(u8, split.second, ',');
+                while (iter.next()) |flag| {
+                    if (flag.len == 0) continue;
+                    inline for (@typeInfo(SectionFlags).@"struct".fields) |field| {
+                        if (strEql(flag, field.name)) {
+                            @field(flags, field.name) = true;
+                            break;
+                        }
+                    } else std.log.warn("skipping unrecognized section flag: '{s}'", .{flag});
+                }
+            }
+
+            try opt_set_section_flags.append(arena, .{ .section_name = split.first, .flags = flags });
+        } else fatal("unrecognized argument: '{s}'", .{arg});
+    }
+
+    const input = opt_input orelse fatal("expected input argument", .{});
+    const output = opt_output orelse fatal("expected output argument", .{});
+
+    // @Incomplete guess/detect input object format
+    const input_ofmt: std.Target.ObjectFormat = .elf;
+    const output_ofmt = opt_output_target orelse input_ofmt;
+    _ = output_ofmt; // autofix
+
+    // @Todo Should we read the entire file into memory or seek & read as needed?
+    const input_file = std.fs.cwd().openFile(input, .{}) catch |err|
+        fatal("failed to open {s}: {t}", .{ input, err });
+    defer input_file.close();
+
+    const output_file = try std.fs.cwd().createFile(output, .{});
+    defer output_file.close();
+
+    const elf_obj = try input_file.readToEndAlloc(arena, 1024 * 1024 * 1024);
     var reader: std.Io.Reader = .fixed(elf_obj);
 
     const elf_hdr = try elf.Header.read(&reader);
@@ -26,13 +102,61 @@ pub fn main() !void {
     const string_table: []const u8 = elf_obj[sh_strtab.sh_offset..][0..sh_strtab.sh_size];
 
     var iter = elf_hdr.iterateSectionHeadersBuffer(elf_obj);
-    while (try iter.next()) |section_hdr| {
-        std.debug.assert(section_hdr.sh_name < string_table.len);
+    while (try iter.next()) |_section| {
+        var section = _section;
+        std.debug.assert(section.sh_name < string_table.len);
+
+        const sh_name: []const u8 = if (section.sh_name != 0)
+            std.mem.sliceTo(string_table[section.sh_name..], 0)
+        else
+            "";
+
+        for (opt_set_section_flags.items) |set_flags| {
+            if (strEql(set_flags.section_name, sh_name)) {
+                setSectionFlags(&section, set_flags.flags, elf_hdr.machine == .X86_64);
+            }
+        }
 
         std.debug.print("{f}\n", .{
-            DumpSection{ .section = &section_hdr, .string_table = string_table },
+            DumpSection{ .section = &section, .string_table = string_table },
         });
     }
+    // @Incomplete actually save changes
+    var out_writer = output_file.writer(&.{});
+    try out_writer.interface.writeAll(elf_obj);
+    try out_writer.interface.flush();
+}
+
+const SplitResult = struct { first: []const u8, second: []const u8 };
+
+fn splitOption(option: []const u8) ?SplitResult {
+    const separator = '=';
+    if (option.len < 3) return null; // minimum "a=b"
+    for (1..option.len - 1) |i| {
+        if (option[i] == separator) return .{
+            .first = option[0..i],
+            .second = option[i + 1 ..], // cannot overflow
+        };
+    }
+    return null;
+}
+
+test splitOption {
+    {
+        const split = splitOption(".abc=123");
+        try std.testing.expect(split != null);
+        try std.testing.expectEqualStrings(".abc", split.?.first);
+        try std.testing.expectEqualStrings("123", split.?.second);
+    }
+
+    try std.testing.expectEqual(null, splitOption(""));
+    try std.testing.expectEqual(null, splitOption("abc"));
+    try std.testing.expectEqual(null, splitOption("abc="));
+    try std.testing.expectEqual(null, splitOption("=abc"));
+}
+
+fn strEql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
 }
 
 fn takeShdr(reader: *std.Io.Reader, elf_header: elf.Header) !elf.Elf64_Shdr {
@@ -55,6 +179,11 @@ fn takeShdr(reader: *std.Io.Reader, elf_header: elf.Header) !elf.Elf64_Shdr {
         .sh_entsize = shdr.sh_entsize,
     };
 }
+
+const SetSectionFlags = struct {
+    section_name: []const u8,
+    flags: SectionFlags,
+};
 
 const SectionFlags = struct {
     alloc: bool = false,
@@ -104,7 +233,7 @@ fn setSectionFlags(sh: *elf.Elf64_Shdr, flags: SectionFlags, is_x86_64: bool) vo
     if (flags.strings) new_flags |= elf.SHF_STRINGS;
     if (flags.exclude) new_flags |= elf.SHF_EXCLUDE;
     if (flags.large) {
-        if (!is_x86_64) std.process.fatal(
+        if (!is_x86_64) fatal(
             "zig objcopy: 'large' section flag is only supported on x86_64 targets",
             .{},
         );
@@ -202,7 +331,12 @@ const DumpSection = struct {
                     written += name.len;
                 }
             }
-
+            if (written == 0 and d.section.sh_flags > 0) {
+                var counter: std.Io.Writer.Discarding = .init(&.{});
+                counter.writer.print("0x{x}", .{d.section.sh_flags}) catch unreachable;
+                try writer.print("0x{x}", .{d.section.sh_flags});
+                written += @intCast(counter.count);
+            }
             try writer.splatByteAll(' ', 15 -| written);
             try writer.writeAll(", ");
         }

@@ -92,10 +92,10 @@ For binary outputs, pad the output to the load address `<address>` using a value
 
 ## Old Zig Options
 ```
-Usage: zig objcopy [`options`] input output
+Usage: zig objcopy [options] input output
 
 Options:
-   -h, --help                              Print this help and exit
+  -h, --help                              Print this help and exit
   --output-target=<value>                 Format of the output file
   -O <value>                              Alias for --output-target
   --only-section=<section>                Remove all but <section>
