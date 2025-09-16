@@ -35,8 +35,9 @@ Should also support:
 Is this design sound? Are there pitfalls that I'm missing, perhaps related to object formats?
 
 https://sourceware.org/binutils/docs/ld/BFD.html
+https://gabi.xinuos.com/elf/
 https://gist.github.com/x0nu11byt3/bcb35c3de461e5fb66173071a2379779
-https://groups.google.com/g/llvm-dev/c/obPlL1dU8OM?pli=1
+https://groups.google.com/g/llvm-dev/c/obPlL1dU8OM
 https://maskray.me/blog/2024-01-14-exploring-object-file-formats
 
 
