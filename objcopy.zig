@@ -672,19 +672,18 @@ const ElfObj = struct {
                 elf.SHT_PREINIT_ARRAY => "PREINIT_ARRAY",
                 elf.SHT_GROUP => "GROUP",
                 elf.SHT_SYMTAB_SHNDX => "SYMTAB_SHNDX",
-                elf.SHT_LOOS => "LOOS",
                 elf.SHT_LLVM_ADDRSIG => "LLVM_ADDRSIG",
                 elf.SHT_GNU_HASH => "GNU_HASH",
                 elf.SHT_GNU_VERDEF => "GNU_VERDEF",
                 elf.SHT_GNU_VERNEED => "GNU_VERNEED",
-                elf.SHT_GNU_VERSYM => "GNU_VERSYM/SHT_HIOS",
-                // elf.SHT_HIOS => "HIOS",
-                elf.SHT_LOPROC => "LOPROC",
+                elf.SHT_GNU_VERSYM => "GNU_VERSYM",
                 elf.SHT_X86_64_UNWIND => "X86_64_UNWIND",
-                elf.SHT_HIPROC => "HIPROC",
-                elf.SHT_LOUSER => "LOUSER",
-                elf.SHT_HIUSER => "HIUSER",
-                else => "unknown",
+                else => |sh_type| switch (sh_type) {
+                    elf.SHT_LOOS...elf.SHT_HIOS => "OS_unknown",
+                    elf.SHT_LOPROC...elf.SHT_HIPROC => "PROC_unknown",
+                    elf.SHT_LOUSER...elf.SHT_HIUSER => "USER_unknown",
+                    else => "unknown",
+                },
             };
 
             try writer.print("[{d: >2}] name: {s: <20}, type: {s: <13}, ", .{ d.idx, sh_name, sh_type });
