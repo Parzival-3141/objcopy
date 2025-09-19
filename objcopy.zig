@@ -295,18 +295,9 @@ const ElfObj = struct {
         gpa: std.mem.Allocator,
         section: Section,
     ) !void {
-        const ref = try obj.putSection(gpa, section);
-        try obj.sections.append(gpa, ref);
-    }
-
-    fn putSection(
-        obj: *ElfObj,
-        gpa: std.mem.Allocator,
-        section: Section,
-    ) !Section.Ref {
         try obj.section_buf.append(gpa, section);
         const idx: elf.Word = @intCast(obj.section_buf.items.len - 1);
-        return @enumFromInt(idx);
+        try obj.sections.append(gpa, @enumFromInt(idx));
     }
 
     pub fn read(allocator: std.mem.Allocator, file_reader: *std.fs.File.Reader) !ElfObj {
@@ -552,10 +543,6 @@ const ElfObj = struct {
         return str_idx;
     }
 
-    fn getSectionName(obj: ElfObj, s: Section) [:0]const u8 {
-        return getStrTabEntry(obj.shstrtab_buffer.items, s.sh_name);
-    }
-
     fn getStrTabEntry(strtab: []const u8, off: u32) [:0]const u8 {
         const slice = strtab[off..];
         return slice[0..std.mem.indexOfScalar(u8, slice, 0).? :0];
@@ -620,18 +607,6 @@ const ElfObj = struct {
         }
     };
 
-    pub fn setSectionType(sh: *Section, sh_type: elf.Word) void {
-        // If the section type is changed from SHT_NOBITS,
-        // then the offset might become misaligned.
-        if (sh.sh_type == elf.SHT_NOBITS and sh_type != elf.SHT_NOBITS)
-            sh.sh_offset = std.mem.alignForward(
-                elf.Elf64_Off,
-                sh.sh_offset,
-                @max(sh.sh_addralign, 1),
-            );
-        sh.sh_type = sh_type;
-    }
-
     pub fn setSectionFlags(sh: *Section, flags: SectionFlags, is_x86_64: bool) void {
         // For ELF objects, the flags have the following effects:
         //     alloc = add the SHF_ALLOC flag.
@@ -672,7 +647,7 @@ const ElfObj = struct {
             // LLVM also promotes non-ALLOC NOBITS sections since they're nonsensical.
             sh.sh_flags & elf.SHF_ALLOC == 0))
         {
-            setSectionType(sh, elf.SHT_PROGBITS);
+            sh.sh_type = elf.SHT_PROGBITS;
         }
     }
 
@@ -803,15 +778,4 @@ fn strEql(a: []const u8, b: []const u8) bool {
 
 fn sliceContains(comptime T: type, slice: []const T, needle: T) bool {
     return std.mem.indexOfScalar(T, slice, needle) != null;
-}
-
-// @Todo @Performance use of this function probably means you're using the wrong data structure
-fn linkedListContains(
-    list: std.SinglyLinkedList,
-    needle: *const std.SinglyLinkedList.Node,
-) bool {
-    var it = list.first;
-    return while (it) |node| : (it = node.next) {
-        if (node == needle) break true;
-    } else false;
 }
