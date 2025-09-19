@@ -112,30 +112,37 @@ pub fn main() !void {
     // run section on-removal code depending on section type (only used by group sections to remove child members)
     // remove references to dead sections in alive ones (meat and potatoes)
 
-    elf_obj.removed_sections = blk: {
-        var to_remove: std.SinglyLinkedList = .{};
-        // the first node is always the null section, so we can safely ignore it in removal checks
-        var node = elf_obj.sections.first;
-        while (node) |n| {
-            const section: *ElfObj.Section = @fieldParentPtr("node", n.next orelse break);
+    {
+        var i: usize = 0;
+        while (i < elf_obj.sections.items.len) {
+            const section = elf_obj.sections.items[i].get(elf_obj);
             for (opt_remove_sections.items) |rm_name| {
                 if (strEql(section.name(string_table.*), rm_name)) {
                     // @Incomplete remove from segment list
                     if (section.sh_type & elf.SHT_GROUP > 0) {
                         // @Incomplete remove SHF_GROUP flag from group members
                     }
-                    to_remove.prepend(n.removeNext().?);
+
+                    try elf_obj.removed_sections.append(arena, elf_obj.sections.orderedRemove(i));
                     break;
                 }
-            } else {
-                node = n.next;
-            }
+            } else i += 1;
         }
-        break :blk to_remove;
-    };
+    }
 
-    var it = elf_obj.iterateSections();
-    while (it.next()) |alive_section| {
+    if (elf_obj.removed_sections.items.len > 0) for (elf_obj.sections.items) |alive_ref| {
+        const alive_section = alive_ref.get(elf_obj);
+
+        const S = struct {
+            pub fn deadLink(link: ElfObj.Section.Ref, obj: ElfObj) ?*ElfObj.Section {
+                return if (link != .undef and sliceContains(
+                    ElfObj.Section.Ref,
+                    obj.removed_sections.items,
+                    link,
+                )) link.get(obj) else null;
+            }
+        };
+
         // remove references to dead sections depending on the alive section's type
         switch (alive_section.sh_type) {
             elf.SHT_SYMTAB => {
@@ -143,13 +150,11 @@ pub fn main() !void {
                 // sh_link == The section header index of the associated string table.
                 // sh_info == One greater than the symbol table index of the last local symbol (binding STB_LOCAL).
 
-                if (alive_section.sh_link) |link| {
-                    if (linkedListContains(elf_obj.removed_sections, &link.node)) {
-                        fatal(
-                            "string table '{s}' cannot be removed because it's referenced by symbol table '{s}'",
-                            .{ link.name(string_table.*), alive_section.name(string_table.*) },
-                        );
-                    }
+                if (S.deadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                    fatal(
+                        "string table '{s}' cannot be removed because it's referenced by symbol table '{s}'",
+                        .{ dead_section.name(string_table.*), alive_section.name(string_table.*) },
+                    );
                 }
 
                 // @Incomplete remove symbols that reference dead sections
@@ -164,17 +169,15 @@ pub fn main() !void {
                 std.log.warn("@Incomplete: remove references to dead sections in SHT_REL(A)", .{});
             },
             else => {
-                if (alive_section.sh_link) |link| {
-                    if (linkedListContains(elf_obj.removed_sections, &link.node)) {
-                        fatal(
-                            "section '{s}' cannot be removed because it's referenced by section '{s}'",
-                            .{ link.name(string_table.*), alive_section.name(string_table.*) },
-                        );
-                    }
+                if (S.deadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                    fatal(
+                        "section '{s}' cannot be removed because it's referenced by section '{s}'",
+                        .{ dead_section.name(string_table.*), alive_section.name(string_table.*) },
+                    );
                 }
             },
         }
-    }
+    };
 
     // Add sections
     for (opt_add_sections.items) |add| {
@@ -186,7 +189,8 @@ pub fn main() !void {
         errdefer add_file.close();
         const stat = try add_file.stat();
 
-        const new_sect: *ElfObj.Section = try arena.create(ElfObj.Section);
+        try elf_obj.sections.ensureUnusedCapacity(arena, 1);
+        try elf_obj.section_buf.ensureUnusedCapacity(arena, 1);
         const name_idx = try elf_obj.insertShString(arena, add.section_name);
 
         const sect_type: elf.Word = if (std.mem.startsWith(u8, add.section_name, ".note"))
@@ -194,46 +198,37 @@ pub fn main() !void {
         else
             elf.SHT_PROGBITS;
 
-        new_sect.* = .{
-            .node = .{},
+        elf_obj.appendSection(arena, .{
             .sh_name = name_idx,
             .sh_type = sect_type,
             .sh_flags = 0,
             .sh_addr = 0,
             .sh_offset = ElfObj.Section.null_offset,
             .sh_size = stat.size,
-            .sh_link = null,
+            .sh_link = .undef,
             .sh_info = 0,
             .sh_addralign = 1,
             .sh_entsize = 0,
             .payload = .{ .file = add_file },
+        }) catch |err| switch (err) {
+            error.OutOfMemory => unreachable,
         };
-        if (elf_obj.sections.first) |first| {
-            first.findLast().insertAfter(&new_sect.node);
-        } else elf_obj.sections.prepend(&new_sect.node);
     }
 
     // Set section flags
     // @Todo fail on no matches?
-    it.reset(elf_obj);
-    while (it.next()) |section| {
-        const sh_name = section.name(string_table.*);
+    for (elf_obj.sections.items) |ref| {
+        const section = ref.get(elf_obj);
         for (opt_set_section_flags.items) |set_flags| {
-            if (strEql(set_flags.section_name, sh_name)) {
+            if (strEql(set_flags.section_name, section.name(string_table.*))) {
                 ElfObj.setSectionFlags(section, set_flags.flags, elf_obj.header.machine == .X86_64);
             }
         }
     }
 
-    try elf_obj.computeFinalLayout();
+    try elf_obj.computeFinalLayout(arena);
 
-    var i: usize = 0;
-    it.reset(elf_obj);
-    while (it.next()) |section| : (i += 1) {
-        std.debug.print("{f}\n", .{
-            ElfObj.DumpSection{ .idx = i, .section = section, .string_table = string_table.* },
-        });
-    }
+    std.debug.print("{f}\n", .{elf_obj});
 
     var out_buffer: [4096]u8 = undefined;
     var out_writer = output_file.writer(&out_buffer);
@@ -258,7 +253,7 @@ const SetSectionFlags = struct {
     flags: SectionFlags,
 };
 
-const SectionFlags = struct {
+const SectionFlags = packed struct {
     alloc: bool = false,
     load: bool = false,
     noload: bool = false,
@@ -279,18 +274,40 @@ const SectionFlags = struct {
 const ElfObj = struct {
     header: elf.Header,
 
-    // Stored in native-endian format, depending on target endianness needs to be bswapped on read/write.
-    // Same order as in the file.
+    // Program/Section header tables are stored in native-endian format,
+    // and depending on target endianness must be byte-swapped on write.
+    // Same order as in the input.
+
     phdr_table: []elf.Elf64_Phdr,
 
-    // Updating section indices while modifying the data is annoying, so section references are stored as pointers instead.
-    // Sections are stored in a linked list to preserve insertion order without invalidating pointers.
-    sections: std.SinglyLinkedList,
+    /// Ordered list of section headers in output
+    sections: std.ArrayList(Section.Ref),
+    /// Backing memory for sections
+    section_buf: std.ArrayList(Section),
 
-    shstrtab: *Section,
+    removed_sections: std.ArrayList(Section.Ref),
+
+    shstrtab: Section.Ref,
     shstrtab_buffer: std.ArrayList(u8),
 
-    removed_sections: std.SinglyLinkedList,
+    fn appendSection(
+        obj: *ElfObj,
+        gpa: std.mem.Allocator,
+        section: Section,
+    ) !void {
+        const ref = try obj.putSection(gpa, section);
+        try obj.sections.append(gpa, ref);
+    }
+
+    fn putSection(
+        obj: *ElfObj,
+        gpa: std.mem.Allocator,
+        section: Section,
+    ) !Section.Ref {
+        try obj.section_buf.append(gpa, section);
+        const idx: elf.Word = @intCast(obj.section_buf.items.len - 1);
+        return @enumFromInt(idx);
+    }
 
     pub fn read(allocator: std.mem.Allocator, file_reader: *std.fs.File.Reader) !ElfObj {
         const header = try elf.Header.read(&file_reader.interface);
@@ -299,12 +316,12 @@ const ElfObj = struct {
         if (header.shstrndx == elf.SHN_UNDEF)
             fatal("missing section .shstrtab: zig objcopy requires the section name string table in order to run", .{});
 
-        var shstrtab: *Section = undefined;
-
         const phdrs = try allocator.alloc(elf.Elf64_Phdr, header.phnum);
         errdefer allocator.free(phdrs);
         const sections = try allocator.alloc(Section, header.shnum);
         errdefer allocator.free(sections);
+        const section_refs = try allocator.alloc(Section.Ref, header.shnum);
+        errdefer allocator.free(section_refs);
 
         var i: usize = 0;
         var ph_iter = header.iterateProgramHeaders(file_reader);
@@ -312,39 +329,28 @@ const ElfObj = struct {
         std.debug.assert(i == header.phnum);
 
         i = 0;
-        var section_list: std.SinglyLinkedList = .{};
-        var prev_node: ?*std.SinglyLinkedList.Node = null;
         var sh_iter = header.iterateSectionHeaders(file_reader);
         while (try sh_iter.next()) |sh| : (i += 1) {
+            section_refs[i] = @enumFromInt(i);
             sections[i] = .{
-                .node = .{},
                 .sh_name = sh.sh_name,
                 .sh_type = sh.sh_type,
                 .sh_flags = sh.sh_flags,
                 .sh_addr = sh.sh_addr,
                 .sh_offset = sh.sh_offset,
                 .sh_size = sh.sh_size,
-                .sh_link = if (sh.sh_link != elf.SHN_UNDEF) &sections[sh.sh_link] else null,
+                .sh_link = @enumFromInt(sh.sh_link),
                 .sh_info = sh.sh_info,
                 .sh_addralign = sh.sh_addralign,
                 .sh_entsize = sh.sh_entsize,
                 .original_offset = sh.sh_offset,
             };
-            if (header.shstrndx == i)
-                shstrtab = &sections[i];
-
-            // append to last node orelse set first
-            if (prev_node) |n| {
-                n.insertAfter(&sections[i].node);
-            } else {
-                section_list.prepend(&sections[i].node);
-            }
-            prev_node = &sections[i].node;
         }
         std.debug.assert(i == header.shnum);
 
         var shstrtab_buf: std.ArrayList(u8) = .empty; // @Todo if running without an existing shstrtab is ever supported, this needs to be initialized to `&.{0}`.
         {
+            const shstrtab = &sections[header.shstrndx];
             try file_reader.seekTo(shstrtab.original_offset);
             const size = shstrtab.sh_size;
             var w: std.Io.Writer.Allocating = try .initCapacity(allocator, size);
@@ -357,19 +363,20 @@ const ElfObj = struct {
         return .{
             .header = header,
             .phdr_table = phdrs,
-            .sections = section_list,
-            .shstrtab = shstrtab,
+            .sections = .fromOwnedSlice(section_refs),
+            .section_buf = .fromOwnedSlice(sections),
+            .shstrtab = @enumFromInt(header.shstrndx),
             .shstrtab_buffer = shstrtab_buf,
             .removed_sections = .{},
         };
     }
 
-    pub fn computeFinalLayout(obj: *ElfObj) !void {
+    pub fn computeFinalLayout(obj: *ElfObj, allocator: std.mem.Allocator) !void {
         obj.header.phnum = @intCast(obj.phdr_table.len);
-        obj.header.shnum = @intCast(obj.sections.len());
+        obj.header.shnum = @intCast(obj.sections.items.len);
 
         // set shstrtab to use the updated string contents
-        obj.shstrtab.payload = .{
+        obj.shstrtab.get(obj.*).payload = .{
             .bytes = obj.shstrtab_buffer.items,
         };
 
@@ -383,15 +390,25 @@ const ElfObj = struct {
         obj.header.phoff = if (obj.header.phnum > 0) offset else 0;
         offset += obj.header.phentsize * obj.header.phnum;
 
+        // Contents should be written in ascending offset order.
+        const shdrs_sorted_by_content_offset = try allocator.dupe(Section.Ref, obj.sections.items);
+        defer allocator.free(shdrs_sorted_by_content_offset);
+        std.mem.sort(Section.Ref, shdrs_sorted_by_content_offset, obj, struct {
+            pub fn lessThan(o: *const ElfObj, a: Section.Ref, b: Section.Ref) bool {
+                // sections with `null_offset`s will be sorted to the end
+                return a.get(o.*).original_offset < b.get(o.*).original_offset;
+            }
+        }.lessThan);
+
         // Whether the section table comes before or after the contents is largely arbitrary,
         // but most educational materials show the table at the end.
-        var i: elf.Word = 0;
-        var it = obj.iterateSections();
-        while (it.next()) |section| : (i += 1) {
+        for (shdrs_sorted_by_content_offset) |ref| {
+            const section = ref.get(obj.*);
+            if (section.sh_type == elf.SHT_NULL) continue;
+
             const alignment: std.mem.Alignment = .fromByteUnits(@max(1, section.sh_addralign));
             offset = alignment.forward(offset);
             section.sh_offset = offset;
-            section.final_index = i;
 
             offset += size: {
                 if (section.payload) |payload| switch (payload) {
@@ -406,6 +423,10 @@ const ElfObj = struct {
                     break :size section.sh_size;
                 }
             };
+        }
+
+        for (obj.sections.items, 0..) |ref, i| {
+            ref.get(obj.*).final_index = @intCast(i);
         }
 
         obj.header.shoff = if (obj.header.shnum > 0) offset else 0;
@@ -452,6 +473,8 @@ const ElfObj = struct {
                 };
                 try output.interface.writeStruct(ehdr, obj.header.endian);
 
+                try output.interface.flush();
+                try output.seekTo(obj.header.phoff);
                 for (obj.phdr_table) |phdr| {
                     const tgt_phdr: if (is_64) elf.Elf64_Phdr else elf.Elf32_Phdr = .{
                         .p_type = phdr.p_type,
@@ -466,8 +489,8 @@ const ElfObj = struct {
                     try output.interface.writeStruct(tgt_phdr, obj.header.endian);
                 }
 
-                var it = obj.iterateSections();
-                while (it.next()) |section| {
+                for (obj.sections.items) |ref| {
+                    const section = ref.get(obj);
                     try output.interface.flush();
                     try output.seekTo(section.sh_offset);
 
@@ -489,8 +512,10 @@ const ElfObj = struct {
                     }
                 }
 
-                it.reset(obj);
-                while (it.next()) |section| {
+                try output.interface.flush();
+                try output.seekTo(obj.header.shoff);
+                for (obj.sections.items) |ref| {
+                    const section = ref.get(obj);
                     const shdr: if (is_64) elf.Elf64_Shdr else elf.Elf32_Shdr = .{
                         .sh_name = section.sh_name,
                         .sh_type = section.sh_type,
@@ -498,7 +523,10 @@ const ElfObj = struct {
                         .sh_addr = @intCast(section.sh_addr),
                         .sh_offset = @intCast(section.sh_offset),
                         .sh_size = @intCast(section.sh_size),
-                        .sh_link = if (section.sh_link) |link| link.final_index else elf.SHN_UNDEF,
+                        .sh_link = switch (section.sh_link) {
+                            .undef => elf.SHN_UNDEF,
+                            else => section.sh_link.get(obj).final_index,
+                        },
                         .sh_info = section.sh_info,
                         .sh_addralign = @intCast(section.sh_addralign),
                         .sh_entsize = @intCast(section.sh_entsize),
@@ -509,23 +537,6 @@ const ElfObj = struct {
         }
     }
 
-    pub fn iterateSections(obj: ElfObj) SectionIterator {
-        return .{ .node = obj.sections.first };
-    }
-    const SectionIterator = struct {
-        node: ?*std.SinglyLinkedList.Node,
-
-        pub fn next(it: *SectionIterator) ?*Section {
-            const n = it.node orelse return null;
-            it.node = n.next;
-            return @fieldParentPtr("node", n);
-        }
-
-        pub fn reset(it: *SectionIterator, obj: ElfObj) void {
-            it.node = obj.sections.first;
-        }
-    };
-
     fn insertShString(
         obj: *ElfObj,
         // @Todo ElfObj should probably have it's own allocator
@@ -533,7 +544,7 @@ const ElfObj = struct {
         str: []const u8,
     ) !u32 {
         try obj.shstrtab_buffer.ensureUnusedCapacity(allocator, str.len + 1);
-        obj.shstrtab.sh_size += str.len + 1;
+        obj.shstrtab.get(obj.*).sh_size += str.len + 1;
 
         const str_idx: u32 = @intCast(obj.shstrtab_buffer.items.len);
         obj.shstrtab_buffer.appendSliceAssumeCapacity(str);
@@ -551,8 +562,6 @@ const ElfObj = struct {
     }
 
     const Section = struct {
-        node: std.SinglyLinkedList.Node,
-
         sh_name: elf.Word,
         sh_type: elf.Word,
         sh_flags: elf.Elf64_Xword,
@@ -560,8 +569,7 @@ const ElfObj = struct {
         sh_offset: elf.Elf64_Off,
         sh_size: elf.Elf64_Xword,
 
-        // sh_link: elf.Word,
-        sh_link: ?*Section, // @Incomplete cannot represent special section indexes
+        sh_link: Ref,
         sh_info: elf.Word,
 
         sh_addralign: elf.Elf64_Xword,
@@ -579,6 +587,28 @@ const ElfObj = struct {
         original_offset: elf.Elf64_Off = null_offset,
 
         const null_offset = std.math.maxInt(elf.Elf64_Off);
+
+        const Ref = enum(elf.Half) {
+            undef = elf.SHN_UNDEF,
+
+            // These only apply for index fields that are Half sized,
+            // (i.e. st_shndx, e_shnum, and e_shstrndx), otherwise
+            // they should be ignored and the index treated as normal.
+            abs = elf.SHN_ABS,
+            common = elf.SHN_COMMON,
+            xindex = 0xffff,
+            _,
+
+            fn reserved(r: Ref) bool {
+                const i = @intFromEnum(r);
+                return elf.SHN_LORESERVE <= i and i <= elf.SHN_HIRESERVE;
+            }
+
+            fn get(r: Ref, obj: ElfObj) *Section {
+                // It's fine if r == .undef since the null section is stored as well.
+                return &obj.section_buf.items[@intFromEnum(r)];
+            }
+        };
 
         const Payload = union(enum) {
             file: std.fs.File,
@@ -646,15 +676,11 @@ const ElfObj = struct {
         }
     }
 
-    pub const DumpSection = struct {
-        idx: usize,
-        section: *const Section,
-        string_table: []const u8,
+    pub fn format(obj: ElfObj, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (obj.sections.items, 0..) |ref, i| {
+            const section = ref.get(obj);
 
-        pub fn format(d: DumpSection, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            const sh_name = getStrTabEntry(d.string_table, d.section.sh_name);
-
-            const sh_type = switch (d.section.sh_type) {
+            const sh_type = switch (section.sh_type) {
                 elf.SHT_NULL => "NULL",
                 elf.SHT_PROGBITS => "PROGBITS",
                 elf.SHT_SYMTAB => "SYMTAB",
@@ -686,7 +712,10 @@ const ElfObj = struct {
                 },
             };
 
-            try writer.print("[{d: >2}] name: {s: <20}, type: {s: <13}, ", .{ d.idx, sh_name, sh_type });
+            try writer.print(
+                "[{d: >2}] name: {s: <20}, type: {s: <13}, ",
+                .{ i, section.name(obj.shstrtab_buffer.items), sh_type },
+            );
             {
                 try writer.writeAll("flags: ");
                 var written: u8 = 0;
@@ -707,7 +736,7 @@ const ElfObj = struct {
                     "COMPRESSED", "MASKOS",
                     "MASKPROC",   "EXCLUDE",
                 }) |flag, name| {
-                    if (d.section.sh_flags & flag > 0) {
+                    if (section.sh_flags & flag > 0) {
                         if (written > 0) {
                             try writer.writeByte('|');
                             written += 1;
@@ -716,10 +745,10 @@ const ElfObj = struct {
                         written += name.len;
                     }
                 }
-                if (written == 0 and d.section.sh_flags > 0) {
+                if (written == 0 and section.sh_flags > 0) {
                     var counter: std.Io.Writer.Discarding = .init(&.{});
-                    counter.writer.print("0x{x}", .{d.section.sh_flags}) catch unreachable;
-                    try writer.print("0x{x}", .{d.section.sh_flags});
+                    counter.writer.print("0x{x}", .{section.sh_flags}) catch unreachable;
+                    try writer.print("0x{x}", .{section.sh_flags});
                     written += @intCast(counter.count);
                 }
                 try writer.splatByteAll(' ', 15 -| written);
@@ -727,17 +756,17 @@ const ElfObj = struct {
             }
 
             try writer.print("addr: 0x{x: <6}, offset: 0x{x: <6}, size: {d: <8}, " ++
-                "link: {d: <4}, info: {d: <4}, addralign: {d: <4}, entsize: {d}", .{
-                d.section.sh_addr,
-                d.section.sh_offset,
-                d.section.sh_size,
-                if (d.section.sh_link) |link| link.final_index else elf.SHN_UNDEF,
-                d.section.sh_info,
-                d.section.sh_addralign,
-                d.section.sh_entsize,
+                "link: {d: <4}, info: {d: <4}, addralign: {d: <4}, entsize: {d}\n", .{
+                section.sh_addr,
+                section.sh_offset,
+                section.sh_size,
+                section.sh_link.get(obj).final_index,
+                section.sh_info,
+                section.sh_addralign,
+                section.sh_entsize,
             });
         }
-    };
+    }
 };
 
 const SplitResult = struct { first: []const u8, second: []const u8 };
@@ -770,6 +799,10 @@ test splitOption {
 
 fn strEql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn sliceContains(comptime T: type, slice: []const T, needle: T) bool {
+    return std.mem.indexOfScalar(T, slice, needle) != null;
 }
 
 // @Todo @Performance use of this function probably means you're using the wrong data structure
