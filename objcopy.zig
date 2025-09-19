@@ -114,8 +114,8 @@ pub fn main() !void {
 
     {
         var i: usize = 0;
-        while (i < elf_obj.sections.items.len) {
-            const section = elf_obj.sections.items[i].get(elf_obj);
+        while (i < elf_obj.shdr_table.items.len) {
+            const section = elf_obj.shdr_table.items[i].get(elf_obj);
             for (opt_remove_sections.items) |rm_name| {
                 if (strEql(section.name(string_table.*), rm_name)) {
                     // @Incomplete remove from segment list
@@ -123,20 +123,20 @@ pub fn main() !void {
                         // @Incomplete remove SHF_GROUP flag from group members
                     }
 
-                    try elf_obj.removed_sections.append(arena, elf_obj.sections.orderedRemove(i));
+                    try elf_obj.removed_sections.append(arena, elf_obj.shdr_table.orderedRemove(i));
                     break;
                 }
             } else i += 1;
         }
     }
 
-    if (elf_obj.removed_sections.items.len > 0) for (elf_obj.sections.items) |alive_ref| {
+    if (elf_obj.removed_sections.items.len > 0) for (elf_obj.shdr_table.items) |alive_ref| {
         const alive_section = alive_ref.get(elf_obj);
 
         const S = struct {
-            pub fn deadLink(link: ElfObj.Section.Ref, obj: ElfObj) ?*ElfObj.Section {
+            pub fn deadLink(link: ElfObj.Shdr.Ref, obj: ElfObj) ?*ElfObj.Shdr {
                 return if (link != .undef and sliceContains(
-                    ElfObj.Section.Ref,
+                    ElfObj.Shdr.Ref,
                     obj.removed_sections.items,
                     link,
                 )) link.get(obj) else null;
@@ -189,21 +189,21 @@ pub fn main() !void {
         errdefer add_file.close();
         const stat = try add_file.stat();
 
-        try elf_obj.sections.ensureUnusedCapacity(arena, 1);
-        try elf_obj.section_buf.ensureUnusedCapacity(arena, 1);
+        try elf_obj.shdr_table.ensureUnusedCapacity(arena, 1);
+        try elf_obj.shdr_buf.ensureUnusedCapacity(arena, 1);
         const name_idx = try elf_obj.insertShString(arena, add.section_name);
 
-        const sect_type: elf.Word = if (std.mem.startsWith(u8, add.section_name, ".note"))
+        const sh_type: elf.Word = if (std.mem.startsWith(u8, add.section_name, ".note"))
             elf.SHT_NOTE
         else
             elf.SHT_PROGBITS;
 
         elf_obj.appendSection(arena, .{
             .sh_name = name_idx,
-            .sh_type = sect_type,
+            .sh_type = sh_type,
             .sh_flags = 0,
             .sh_addr = 0,
-            .sh_offset = ElfObj.Section.null_offset,
+            .sh_offset = ElfObj.Shdr.null_offset,
             .sh_size = stat.size,
             .sh_link = .undef,
             .sh_info = 0,
@@ -216,8 +216,8 @@ pub fn main() !void {
     }
 
     // Set section flags
-    // @Todo fail on no matches?
-    for (elf_obj.sections.items) |ref| {
+    // @Todo fail on no matches? Would it prevent bugs?
+    for (elf_obj.shdr_table.items) |ref| {
         const section = ref.get(elf_obj);
         for (opt_set_section_flags.items) |set_flags| {
             if (strEql(set_flags.section_name, section.name(string_table.*))) {
@@ -281,23 +281,19 @@ const ElfObj = struct {
     phdr_table: []elf.Elf64_Phdr,
 
     /// Ordered list of section headers in output
-    sections: std.ArrayList(Section.Ref),
-    /// Backing memory for sections
-    section_buf: std.ArrayList(Section),
+    shdr_table: std.ArrayList(Shdr.Ref),
+    /// Backing memory for section headers
+    shdr_buf: std.ArrayList(Shdr),
 
-    removed_sections: std.ArrayList(Section.Ref),
+    removed_sections: std.ArrayList(Shdr.Ref),
 
-    shstrtab: Section.Ref,
+    shstrtab: Shdr.Ref,
     shstrtab_buffer: std.ArrayList(u8),
 
-    fn appendSection(
-        obj: *ElfObj,
-        gpa: std.mem.Allocator,
-        section: Section,
-    ) !void {
-        try obj.section_buf.append(gpa, section);
-        const idx: elf.Word = @intCast(obj.section_buf.items.len - 1);
-        try obj.sections.append(gpa, @enumFromInt(idx));
+    fn appendSection(obj: *ElfObj, arena: std.mem.Allocator, section: Shdr) !void {
+        try obj.shdr_buf.append(arena, section);
+        const idx: elf.Word = @intCast(obj.shdr_buf.items.len - 1);
+        try obj.shdr_table.append(arena, @enumFromInt(idx));
     }
 
     pub fn read(allocator: std.mem.Allocator, file_reader: *std.fs.File.Reader) !ElfObj {
@@ -309,10 +305,10 @@ const ElfObj = struct {
 
         const phdrs = try allocator.alloc(elf.Elf64_Phdr, header.phnum);
         errdefer allocator.free(phdrs);
-        const sections = try allocator.alloc(Section, header.shnum);
-        errdefer allocator.free(sections);
-        const section_refs = try allocator.alloc(Section.Ref, header.shnum);
-        errdefer allocator.free(section_refs);
+        const shdrs = try allocator.alloc(Shdr, header.shnum);
+        errdefer allocator.free(shdrs);
+        const shdr_refs = try allocator.alloc(Shdr.Ref, header.shnum);
+        errdefer allocator.free(shdr_refs);
 
         var i: usize = 0;
         var ph_iter = header.iterateProgramHeaders(file_reader);
@@ -322,8 +318,8 @@ const ElfObj = struct {
         i = 0;
         var sh_iter = header.iterateSectionHeaders(file_reader);
         while (try sh_iter.next()) |sh| : (i += 1) {
-            section_refs[i] = @enumFromInt(i);
-            sections[i] = .{
+            shdr_refs[i] = @enumFromInt(i);
+            shdrs[i] = .{
                 .sh_name = sh.sh_name,
                 .sh_type = sh.sh_type,
                 .sh_flags = sh.sh_flags,
@@ -341,7 +337,7 @@ const ElfObj = struct {
 
         var shstrtab_buf: std.ArrayList(u8) = .empty; // @Todo if running without an existing shstrtab is ever supported, this needs to be initialized to `&.{0}`.
         {
-            const shstrtab = &sections[header.shstrndx];
+            const shstrtab = &shdrs[header.shstrndx];
             try file_reader.seekTo(shstrtab.original_offset);
             const size = shstrtab.sh_size;
             var w: std.Io.Writer.Allocating = try .initCapacity(allocator, size);
@@ -354,8 +350,8 @@ const ElfObj = struct {
         return .{
             .header = header,
             .phdr_table = phdrs,
-            .sections = .fromOwnedSlice(section_refs),
-            .section_buf = .fromOwnedSlice(sections),
+            .shdr_table = .fromOwnedSlice(shdr_refs),
+            .shdr_buf = .fromOwnedSlice(shdrs),
             .shstrtab = @enumFromInt(header.shstrndx),
             .shstrtab_buffer = shstrtab_buf,
             .removed_sections = .{},
@@ -364,7 +360,7 @@ const ElfObj = struct {
 
     pub fn computeFinalLayout(obj: *ElfObj, allocator: std.mem.Allocator) !void {
         obj.header.phnum = @intCast(obj.phdr_table.len);
-        obj.header.shnum = @intCast(obj.sections.items.len);
+        obj.header.shnum = @intCast(obj.shdr_table.items.len);
 
         // set shstrtab to use the updated string contents
         obj.shstrtab.get(obj.*).payload = .{
@@ -382,10 +378,10 @@ const ElfObj = struct {
         offset += obj.header.phentsize * obj.header.phnum;
 
         // Contents should be written in ascending offset order.
-        const shdrs_sorted_by_content_offset = try allocator.dupe(Section.Ref, obj.sections.items);
+        const shdrs_sorted_by_content_offset = try allocator.dupe(Shdr.Ref, obj.shdr_table.items);
         defer allocator.free(shdrs_sorted_by_content_offset);
-        std.mem.sort(Section.Ref, shdrs_sorted_by_content_offset, obj, struct {
-            pub fn lessThan(o: *const ElfObj, a: Section.Ref, b: Section.Ref) bool {
+        std.mem.sort(Shdr.Ref, shdrs_sorted_by_content_offset, obj, struct {
+            pub fn lessThan(o: *const ElfObj, a: Shdr.Ref, b: Shdr.Ref) bool {
                 // sections with `null_offset`s will be sorted to the end
                 return a.get(o.*).original_offset < b.get(o.*).original_offset;
             }
@@ -416,7 +412,7 @@ const ElfObj = struct {
             };
         }
 
-        for (obj.sections.items, 0..) |ref, i| {
+        for (obj.shdr_table.items, 0..) |ref, i| {
             ref.get(obj.*).final_index = @intCast(i);
         }
 
@@ -480,7 +476,7 @@ const ElfObj = struct {
                     try output.interface.writeStruct(tgt_phdr, obj.header.endian);
                 }
 
-                for (obj.sections.items) |ref| {
+                for (obj.shdr_table.items) |ref| {
                     const section = ref.get(obj);
                     try output.interface.flush();
                     try output.seekTo(section.sh_offset);
@@ -497,7 +493,7 @@ const ElfObj = struct {
                         },
                     } else {
                         // pull unmodified data from input
-                        std.debug.assert(section.original_offset != Section.null_offset);
+                        std.debug.assert(section.original_offset != Shdr.null_offset);
                         try input.seekTo(section.original_offset);
                         _ = try output.interface.sendFileAll(input, .limited64(section.sh_size));
                     }
@@ -505,7 +501,7 @@ const ElfObj = struct {
 
                 try output.interface.flush();
                 try output.seekTo(obj.header.shoff);
-                for (obj.sections.items) |ref| {
+                for (obj.shdr_table.items) |ref| {
                     const section = ref.get(obj);
                     const shdr: if (is_64) elf.Elf64_Shdr else elf.Elf32_Shdr = .{
                         .sh_name = section.sh_name,
@@ -548,7 +544,7 @@ const ElfObj = struct {
         return slice[0..std.mem.indexOfScalar(u8, slice, 0).? :0];
     }
 
-    const Section = struct {
+    const Shdr = struct {
         sh_name: elf.Word,
         sh_type: elf.Word,
         sh_flags: elf.Elf64_Xword,
@@ -575,6 +571,7 @@ const ElfObj = struct {
 
         const null_offset = std.math.maxInt(elf.Elf64_Off);
 
+        /// Stable Shdr reference.
         const Ref = enum(elf.Half) {
             undef = elf.SHN_UNDEF,
 
@@ -591,9 +588,9 @@ const ElfObj = struct {
                 return elf.SHN_LORESERVE <= i and i <= elf.SHN_HIRESERVE;
             }
 
-            fn get(r: Ref, obj: ElfObj) *Section {
+            fn get(r: Ref, obj: ElfObj) *Shdr {
                 // It's fine if r == .undef since the null section is stored as well.
-                return &obj.section_buf.items[@intFromEnum(r)];
+                return &obj.shdr_buf.items[@intFromEnum(r)];
             }
         };
 
@@ -602,12 +599,12 @@ const ElfObj = struct {
             bytes: []u8,
         };
 
-        fn name(s: Section, shstrtab: []const u8) [:0]const u8 {
+        fn name(s: Shdr, shstrtab: []const u8) [:0]const u8 {
             return getStrTabEntry(shstrtab, s.sh_name);
         }
     };
 
-    pub fn setSectionFlags(sh: *Section, flags: SectionFlags, is_x86_64: bool) void {
+    pub fn setSectionFlags(sh: *Shdr, flags: SectionFlags, is_x86_64: bool) void {
         // For ELF objects, the flags have the following effects:
         //     alloc = add the SHF_ALLOC flag.
         //     load = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
@@ -652,7 +649,7 @@ const ElfObj = struct {
     }
 
     pub fn format(obj: ElfObj, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (obj.sections.items, 0..) |ref, i| {
+        for (obj.shdr_table.items, 0..) |ref, i| {
             const section = ref.get(obj);
 
             const sh_type = switch (section.sh_type) {
