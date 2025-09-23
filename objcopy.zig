@@ -416,6 +416,8 @@ const ElfObj = struct {
             ref.get(obj.*).final_index = @intCast(i);
         }
 
+        obj.header.shstrndx = @intCast(obj.shstrtab.get(obj.*).final_index);
+
         obj.header.shoff = if (obj.header.shnum > 0) offset else 0;
         offset += obj.header.shentsize * obj.header.shnum;
     }
