@@ -187,7 +187,6 @@ pub fn main() !void {
         // @Todo maybe save file path/handle and only write/copy when necessary?
         const add_file = try std.fs.cwd().openFile(add.file_path, .{});
         errdefer add_file.close();
-        const stat = try add_file.stat();
 
         try elf_obj.shdr_table.ensureUnusedCapacity(arena, 1);
         try elf_obj.shdr_buf.ensureUnusedCapacity(arena, 1);
@@ -203,8 +202,6 @@ pub fn main() !void {
             .sh_type = sh_type,
             .sh_flags = 0,
             .sh_addr = 0,
-            .sh_offset = ElfObj.Shdr.null_offset,
-            .sh_size = stat.size,
             .sh_link = .undef,
             .sh_info = 0,
             .sh_addralign = 1,
@@ -324,13 +321,12 @@ const ElfObj = struct {
                 .sh_type = sh.sh_type,
                 .sh_flags = sh.sh_flags,
                 .sh_addr = sh.sh_addr,
-                .sh_offset = sh.sh_offset,
-                .sh_size = sh.sh_size,
                 .sh_link = @enumFromInt(sh.sh_link),
                 .sh_info = sh.sh_info,
                 .sh_addralign = sh.sh_addralign,
                 .sh_entsize = sh.sh_entsize,
                 .original_offset = sh.sh_offset,
+                .original_size = sh.sh_size,
             };
         }
         std.debug.assert(i == header.shnum);
@@ -339,7 +335,7 @@ const ElfObj = struct {
         {
             const shstrtab = &shdrs[header.shstrndx];
             try file_reader.seekTo(shstrtab.original_offset);
-            const size = shstrtab.sh_size;
+            const size = shstrtab.original_size;
             var w: std.Io.Writer.Allocating = try .initCapacity(allocator, size);
             errdefer w.deinit();
 
@@ -391,25 +387,29 @@ const ElfObj = struct {
         // but most educational materials show the table at the end.
         for (shdrs_sorted_by_content_offset) |ref| {
             const section = ref.get(obj.*);
-            if (section.sh_type == elf.SHT_NULL) continue;
+            if (section.sh_type == elf.SHT_NULL) {
+                section.final_offset = 0;
+                continue;
+            }
 
             const alignment: std.mem.Alignment = .fromByteUnits(@max(1, section.sh_addralign));
             offset = alignment.forward(offset);
-            section.sh_offset = offset;
+            section.final_offset = offset;
 
-            offset += size: {
+            section.final_size = size: {
                 if (section.payload) |payload| switch (payload) {
                     .file => |file| {
-                        const stat = try file.stat(); // @Todo cache this when adding the section? Would make this fn unable to fail.
+                        const stat = try file.stat(); // @Todo cache this when adding the section?
                         break :size stat.size;
                     },
                     .bytes => |b| {
                         break :size b.len;
                     },
                 } else {
-                    break :size section.sh_size;
+                    break :size section.original_size;
                 }
             };
+            offset += section.final_size;
         }
 
         for (obj.shdr_table.items, 0..) |ref, i| {
@@ -480,8 +480,9 @@ const ElfObj = struct {
 
                 for (obj.shdr_table.items) |ref| {
                     const section = ref.get(obj);
+                    std.debug.assert(section.final_offset != Shdr.null_offset);
                     try output.interface.flush();
-                    try output.seekTo(section.sh_offset);
+                    try output.seekTo(section.final_offset);
 
                     if (section.payload) |payload| switch (payload) {
                         .file => |file| {
@@ -497,7 +498,7 @@ const ElfObj = struct {
                         // pull unmodified data from input
                         std.debug.assert(section.original_offset != Shdr.null_offset);
                         try input.seekTo(section.original_offset);
-                        _ = try output.interface.sendFileAll(input, .limited64(section.sh_size));
+                        _ = try output.interface.sendFileAll(input, .limited64(section.original_size));
                     }
                 }
 
@@ -510,8 +511,8 @@ const ElfObj = struct {
                         .sh_type = section.sh_type,
                         .sh_flags = @intCast(section.sh_flags),
                         .sh_addr = @intCast(section.sh_addr),
-                        .sh_offset = @intCast(section.sh_offset),
-                        .sh_size = @intCast(section.sh_size),
+                        .sh_offset = @intCast(section.final_offset),
+                        .sh_size = @intCast(section.final_size),
                         .sh_link = switch (section.sh_link) {
                             .undef => elf.SHN_UNDEF,
                             else => section.sh_link.get(obj).final_index,
@@ -533,7 +534,6 @@ const ElfObj = struct {
         str: []const u8,
     ) !u32 {
         try obj.shstrtab_buffer.ensureUnusedCapacity(allocator, str.len + 1);
-        obj.shstrtab.get(obj.*).sh_size += str.len + 1;
 
         const str_idx: u32 = @intCast(obj.shstrtab_buffer.items.len);
         obj.shstrtab_buffer.appendSliceAssumeCapacity(str);
@@ -551,8 +551,6 @@ const ElfObj = struct {
         sh_type: elf.Word,
         sh_flags: elf.Elf64_Xword,
         sh_addr: elf.Elf64_Addr,
-        sh_offset: elf.Elf64_Off,
-        sh_size: elf.Elf64_Xword,
 
         sh_link: Ref,
         sh_info: elf.Word,
@@ -566,10 +564,16 @@ const ElfObj = struct {
         /// Used to convert a section reference to an index.
         /// Only valid after calling `ElfObj.computeFinalLayout()`.
         final_index: elf.Word = elf.SHN_UNDEF,
+        /// Only valid after calling `ElfObj.computeFinalLayout()`.
+        final_offset: elf.Elf64_Off = null_offset,
+        /// Only valid after calling `ElfObj.computeFinalLayout()`.
+        final_size: elf.Elf64_Xword = 0,
 
         /// Original `sh_offset` field. Used for reading data from the input file.
         /// Sections that don't originate from the input should use the `null_offset` value.
         original_offset: elf.Elf64_Off = null_offset,
+        /// Original `sh_offset` field. Used for reading data from the input file.
+        original_size: elf.Elf64_Xword = 0,
 
         const null_offset = std.math.maxInt(elf.Elf64_Off);
 
@@ -732,8 +736,8 @@ const ElfObj = struct {
             try writer.print("addr: 0x{x: <6}, offset: 0x{x: <6}, size: {d: <8}, " ++
                 "link: {d: <4}, info: {d: <4}, addralign: {d: <4}, entsize: {d}\n", .{
                 section.sh_addr,
-                section.sh_offset,
-                section.sh_size,
+                section.final_offset,
+                section.final_size,
                 section.sh_link.get(obj).final_index,
                 section.sh_info,
                 section.sh_addralign,
