@@ -90,7 +90,6 @@ pub fn main() !void {
     const input_ofmt: ObjectFormat = .elf;
     const output_ofmt = opt_output_target orelse input_ofmt;
 
-    // @Todo Should we read the entire file into memory or seek & read as needed?
     const input_file = std.fs.cwd().openFile(input, .{}) catch |err|
         fatal("failed to open {s}: {t}", .{ input, err });
     defer input_file.close();
@@ -104,23 +103,24 @@ pub fn main() !void {
     var elf_obj = try ElfObj.read(arena, &input_reader);
     std.debug.print("{}\n", .{elf_obj.header});
 
-    const string_table = &elf_obj.shstrtab_buffer.items;
-
     // Remove sections and any dead references:
     // create list of sections that should be removed
     // remove sections from segments
     // run section on-removal code depending on section type (only used by group sections to remove child members)
     // remove references to dead sections in alive ones (meat and potatoes)
-
     {
         var i: usize = 0;
         while (i < elf_obj.shdr_table.items.len) {
             const section = elf_obj.shdr_table.items[i].get(elf_obj);
             for (opt_remove_sections.items) |rm_name| {
-                if (strEql(section.name(string_table.*), rm_name)) {
+                if (strEql(section.name(elf_obj), rm_name)) {
                     // @Incomplete remove from segment list
-                    if (section.sh_type & elf.SHT_GROUP > 0) {
-                        // @Incomplete remove SHF_GROUP flag from group members
+
+                    if (section.sh_type == elf.SHT_GROUP) {
+                        // remove SHF_GROUP flag from group members
+                        for (section.contents.group.sections.items) |member_ref| {
+                            member_ref.get(elf_obj).sh_flags &= ~@as(elf.Elf64_Xword, elf.SHF_GROUP);
+                        }
                     }
 
                     try elf_obj.removed_sections.append(arena, elf_obj.shdr_table.orderedRemove(i));
@@ -134,7 +134,7 @@ pub fn main() !void {
         const alive_section = alive_ref.get(elf_obj);
 
         const S = struct {
-            pub fn deadLink(link: ElfObj.Shdr.Ref, obj: ElfObj) ?*ElfObj.Shdr {
+            pub fn isDeadLink(link: ElfObj.Shdr.Ref, obj: ElfObj) ?*ElfObj.Shdr {
                 return if (link != .undef and sliceContains(
                     ElfObj.Shdr.Ref,
                     obj.removed_sections.items,
@@ -143,36 +143,88 @@ pub fn main() !void {
             }
         };
 
-        // remove references to dead sections depending on the alive section's type
+        // remove references to dead sections and check for dangling links in alive sections
         switch (alive_section.sh_type) {
             elf.SHT_SYMTAB => {
-                std.log.warn("@Incomplete: remove references to dead sections in SHT_SYMTAB", .{});
-                // sh_link == The section header index of the associated string table.
-                // sh_info == One greater than the symbol table index of the last local symbol (binding STB_LOCAL).
-
-                if (S.deadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                // sh_link: The section header index of the associated string table.
+                if (S.isDeadLink(alive_section.sh_link, elf_obj)) |dead_section| {
                     fatal(
                         "string table '{s}' cannot be removed because it's referenced by symbol table '{s}'",
-                        .{ dead_section.name(string_table.*), alive_section.name(string_table.*) },
+                        .{ dead_section.name(elf_obj), alive_section.name(elf_obj) },
                     );
                 }
 
-                // @Incomplete remove symbols that reference dead sections
+                std.log.warn("@Incomplete: remove symbols that reference dead sections in SHT_SYMTAB", .{});
             },
             elf.SHT_GROUP => {
-                // sh_link == The section header index of the associated symbol table.
-                // sh_info == The symbol table index of an entry in the associated symbol table. The name of the specified symbol table entry provides a signature for the section group.
+                // sh_link: The section header index of the associated symbol table.
+                if (S.isDeadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                    fatal(
+                        "symbol table '{s}' cannot be removed because it's referenced by group section '{s}'",
+                        .{ dead_section.name(elf_obj), alive_section.name(elf_obj) },
+                    );
+                }
 
-                std.log.warn("@Incomplete: remove references to dead sections in SHT_GROUP", .{});
+                // remove dead sections from group
+                const group = &alive_section.contents.group;
+                var i: usize = 0;
+                while (i < group.sections.items.len) {
+                    if (sliceContains(
+                        ElfObj.Shdr.Ref,
+                        elf_obj.removed_sections.items,
+                        group.sections.items[i],
+                    )) {
+                        _ = group.sections.swapRemove(i);
+                    } else i += 1;
+                }
             },
             elf.SHT_REL, elf.SHT_RELA => {
-                std.log.warn("@Incomplete: remove references to dead sections in SHT_REL(A)", .{});
+                // sh_link: The section header index of the associated symbol table.
+                if (S.isDeadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                    fatal(
+                        "symbol table '{s}' cannot be removed because it's referenced by relocation section '{s}'",
+                        .{ dead_section.name(elf_obj), alive_section.name(elf_obj) },
+                    );
+                }
+
+                // sh_info: The section header index of the section to which the relocation applies.
+                const reloc_target_section: ElfObj.Shdr.Ref = @enumFromInt(alive_section.sh_info);
+                if (S.isDeadLink(reloc_target_section, elf_obj)) |dead_section| {
+                    fatal(
+                        "section '{s}' cannot be removed because it's referenced by relocation section '{s}'",
+                        .{ dead_section.name(elf_obj), alive_section.name(elf_obj) },
+                    );
+                }
+
+                // check relocation entries for references to dead sections
+                const symtab_shdr = alive_section.sh_link.get(elf_obj);
+                for (alive_section.contents.relocs.entries.items) |rel| {
+                    const sym_idx = rel.r_sym();
+                    if (sym_idx == 0) continue;
+
+                    // @Incomplete this will break when symbols are added/removed.
+                    const symbol = symtab_shdr.contents.symtab.symbols.items[sym_idx];
+                    if (symbol.st_shndx.reserved()) continue;
+
+                    if (S.isDeadLink(symbol.st_shndx, elf_obj)) |dead_section| {
+                        const sym_name = ElfObj.getStrTabEntry(
+                            symtab_shdr.sh_link.get(elf_obj).contents.strtab.items,
+                            symbol.st_name,
+                        );
+                        fatal("section '{s}' cannot be removed: ({s}+0x{x}) has relocation against symbol '{s}'", .{
+                            dead_section.name(elf_obj),
+                            reloc_target_section.get(elf_obj).name(elf_obj),
+                            rel.r_offset,
+                            sym_name,
+                        });
+                    }
+                }
             },
             else => {
-                if (S.deadLink(alive_section.sh_link, elf_obj)) |dead_section| {
+                if (S.isDeadLink(alive_section.sh_link, elf_obj)) |dead_section| {
                     fatal(
                         "section '{s}' cannot be removed because it's referenced by section '{s}'",
-                        .{ dead_section.name(string_table.*), alive_section.name(string_table.*) },
+                        .{ dead_section.name(elf_obj), alive_section.name(elf_obj) },
                     );
                 }
             },
@@ -206,7 +258,7 @@ pub fn main() !void {
             .sh_info = 0,
             .sh_addralign = 1,
             .sh_entsize = 0,
-            .payload = .{ .file = add_file },
+            .contents = .{ .file = add_file },
         }) catch |err| switch (err) {
             error.OutOfMemory => unreachable,
         };
@@ -217,7 +269,7 @@ pub fn main() !void {
     for (elf_obj.shdr_table.items) |ref| {
         const section = ref.get(elf_obj);
         for (opt_set_section_flags.items) |set_flags| {
-            if (strEql(set_flags.section_name, section.name(string_table.*))) {
+            if (strEql(set_flags.section_name, section.name(elf_obj))) {
                 ElfObj.setSectionFlags(section, set_flags.flags, elf_obj.header.machine == .X86_64);
             }
         }
@@ -285,7 +337,6 @@ const ElfObj = struct {
     removed_sections: std.ArrayList(Shdr.Ref),
 
     shstrtab: Shdr.Ref,
-    shstrtab_buffer: std.ArrayList(u8),
 
     fn appendSection(obj: *ElfObj, arena: std.mem.Allocator, section: Shdr) !void {
         try obj.shdr_buf.append(arena, section);
@@ -327,21 +378,30 @@ const ElfObj = struct {
                 .sh_entsize = sh.sh_entsize,
                 .original_offset = sh.sh_offset,
                 .original_size = sh.sh_size,
+                .contents = .original,
             };
+
+            switch (sh.sh_type) {
+                elf.SHT_SYMTAB, elf.SHT_DYNSYM => shdrs[i].contents = .{
+                    .symtab = try .read(allocator, header, file_reader, shdrs[i]),
+                },
+                elf.SHT_STRTAB => {
+                    var w: std.Io.Writer.Allocating = try .initCapacity(allocator, shdrs[i].original_size);
+                    errdefer w.deinit();
+                    try file_reader.seekTo(shdrs[i].original_offset);
+                    try file_reader.interface.streamExact(&w.writer, shdrs[i].original_size);
+                    shdrs[i].contents = .{ .strtab = w.toArrayList() };
+                },
+                elf.SHT_REL, elf.SHT_RELA => shdrs[i].contents = .{
+                    .relocs = try .read(allocator, header, file_reader, shdrs[i]),
+                },
+                elf.SHT_GROUP => shdrs[i].contents = .{
+                    .group = try .read(allocator, header, file_reader, shdrs[i]),
+                },
+                else => {},
+            }
         }
         std.debug.assert(i == header.shnum);
-
-        var shstrtab_buf: std.ArrayList(u8) = .empty; // @Todo if running without an existing shstrtab is ever supported, this needs to be initialized to `&.{0}`.
-        {
-            const shstrtab = &shdrs[header.shstrndx];
-            try file_reader.seekTo(shstrtab.original_offset);
-            const size = shstrtab.original_size;
-            var w: std.Io.Writer.Allocating = try .initCapacity(allocator, size);
-            errdefer w.deinit();
-
-            try file_reader.interface.streamExact(&w.writer, size);
-            shstrtab_buf = w.toArrayList();
-        }
 
         return .{
             .header = header,
@@ -349,19 +409,13 @@ const ElfObj = struct {
             .shdr_table = .fromOwnedSlice(shdr_refs),
             .shdr_buf = .fromOwnedSlice(shdrs),
             .shstrtab = @enumFromInt(header.shstrndx),
-            .shstrtab_buffer = shstrtab_buf,
-            .removed_sections = .{},
+            .removed_sections = .empty,
         };
     }
 
     pub fn computeFinalLayout(obj: *ElfObj, allocator: std.mem.Allocator) !void {
         obj.header.phnum = @intCast(obj.phdr_table.len);
         obj.header.shnum = @intCast(obj.shdr_table.items.len);
-
-        // set shstrtab to use the updated string contents
-        obj.shstrtab.get(obj.*).payload = .{
-            .bytes = obj.shstrtab_buffer.items,
-        };
 
         var offset: usize = 0;
 
@@ -397,16 +451,16 @@ const ElfObj = struct {
             section.final_offset = offset;
 
             section.final_size = size: {
-                if (section.payload) |payload| switch (payload) {
+                switch (section.contents) {
+                    .original => break :size section.original_size,
                     .file => |file| {
                         const stat = try file.stat(); // @Todo cache this when adding the section?
                         break :size stat.size;
                     },
-                    .bytes => |b| {
-                        break :size b.len;
-                    },
-                } else {
-                    break :size section.original_size;
+                    .symtab => |symtab| break :size symtab.symbols.items.len * section.sh_entsize,
+                    .strtab => |strtab| break :size strtab.items.len,
+                    .relocs => |relocs| break :size relocs.entries.items.len * section.sh_entsize,
+                    .group => |group| break :size (group.sections.items.len + 1) * @sizeOf(elf.Word),
                 }
             };
             offset += section.final_size;
@@ -484,21 +538,69 @@ const ElfObj = struct {
                     try output.interface.flush();
                     try output.seekTo(section.final_offset);
 
-                    if (section.payload) |payload| switch (payload) {
+                    switch (section.contents) {
+                        .original => {
+                            // pull unmodified data from input
+                            std.debug.assert(section.original_offset != Shdr.null_offset);
+                            try input.seekTo(section.original_offset);
+                            _ = try output.interface.sendFileAll(input, .limited64(section.original_size));
+                        },
                         .file => |file| {
                             defer file.close();
                             var buf: [1024]u8 = undefined; // @Performance does this need a buffer?
                             var file_reader = file.reader(&buf);
                             _ = try output.interface.sendFileAll(&file_reader, .unlimited);
                         },
-                        .bytes => |b| {
-                            try output.interface.writeAll(b);
+                        .symtab => |symtab| {
+                            for (symtab.symbols.items) |sym| {
+                                const tgt_sym: if (is_64) elf.Elf64_Sym else elf.Elf32_Sym = .{
+                                    .st_name = sym.st_name,
+                                    .st_info = sym.st_info,
+                                    .st_other = sym.st_other,
+                                    .st_shndx = switch (sym.st_shndx) {
+                                        .abs, .common, .xindex => |val| @intFromEnum(val),
+                                        else => @intCast(sym.st_shndx.get(obj).final_index),
+                                    },
+                                    .st_value = @intCast(sym.st_value),
+                                    .st_size = @intCast(sym.st_size),
+                                };
+                                try output.interface.writeStruct(tgt_sym, obj.header.endian);
+                            }
                         },
-                    } else {
-                        // pull unmodified data from input
-                        std.debug.assert(section.original_offset != Shdr.null_offset);
-                        try input.seekTo(section.original_offset);
-                        _ = try output.interface.sendFileAll(input, .limited64(section.original_size));
+                        .strtab => |strtab| try output.interface.writeAll(strtab.items),
+                        .relocs => |relocs| {
+                            for (relocs.entries.items) |rel| {
+                                const RelT = if (is_64) elf.Elf64_Rela else elf.Elf32_Rela;
+
+                                try output.interface.writeInt(
+                                    @FieldType(RelT, "r_offset"),
+                                    @intCast(rel.r_offset),
+                                    obj.header.endian,
+                                );
+                                try output.interface.writeInt(
+                                    @FieldType(RelT, "r_info"),
+                                    @intCast(rel.r_info),
+                                    obj.header.endian,
+                                );
+                                if (relocs.addend) {
+                                    try output.interface.writeInt(
+                                        @FieldType(RelT, "r_addend"),
+                                        @intCast(rel.r_addend),
+                                        obj.header.endian,
+                                    );
+                                }
+                            }
+                        },
+                        .group => |group| {
+                            try output.interface.writeInt(elf.Word, group.flags, obj.header.endian);
+                            for (group.sections.items) |member_ref| {
+                                try output.interface.writeInt(
+                                    elf.Word,
+                                    member_ref.get(obj).final_index,
+                                    obj.header.endian,
+                                );
+                            }
+                        },
                     }
                 }
 
@@ -527,17 +629,22 @@ const ElfObj = struct {
         }
     }
 
+    fn getShStringTable(obj: ElfObj) []const u8 {
+        return obj.shstrtab.get(obj).contents.strtab.items;
+    }
+
     fn insertShString(
-        obj: *ElfObj,
+        obj: ElfObj,
         // @Todo ElfObj should probably have it's own allocator
         allocator: std.mem.Allocator,
         str: []const u8,
     ) !u32 {
-        try obj.shstrtab_buffer.ensureUnusedCapacity(allocator, str.len + 1);
+        const shstrtab_buffer = &obj.shstrtab.get(obj).contents.strtab;
+        try shstrtab_buffer.ensureUnusedCapacity(allocator, str.len + 1);
 
-        const str_idx: u32 = @intCast(obj.shstrtab_buffer.items.len);
-        obj.shstrtab_buffer.appendSliceAssumeCapacity(str);
-        obj.shstrtab_buffer.appendAssumeCapacity(0);
+        const str_idx: u32 = @intCast(shstrtab_buffer.items.len);
+        shstrtab_buffer.appendSliceAssumeCapacity(str);
+        shstrtab_buffer.appendAssumeCapacity(0);
         return str_idx;
     }
 
@@ -558,8 +665,22 @@ const ElfObj = struct {
         sh_addralign: elf.Elf64_Xword,
         sh_entsize: elf.Elf64_Xword,
 
-        /// Data that will be added with this section.
-        payload: ?Payload = null,
+        // @Incomplete store in PWP manner. Common types use shared pools (e.g. all strtabs are backed by one arraylist)
+        contents: union(enum) {
+            /// Untracked contents
+            original,
+            /// Use contents from a file
+            file: std.fs.File,
+            // @Todo there can only be one section of each type, so they can be stored in ElfObj instead
+            /// SHT_SYMTAB or SHT_DYNSYM
+            symtab: SymtabSection,
+            /// SHT_STRTAB
+            strtab: std.ArrayList(u8),
+            /// SHT_REL or SHT_RELA
+            relocs: RelocationSection,
+            /// SHT_GROUP
+            group: GroupSection,
+        },
 
         /// Used to convert a section reference to an index.
         /// Only valid after calling `ElfObj.computeFinalLayout()`.
@@ -600,13 +721,8 @@ const ElfObj = struct {
             }
         };
 
-        const Payload = union(enum) {
-            file: std.fs.File,
-            bytes: []u8,
-        };
-
-        fn name(s: Shdr, shstrtab: []const u8) [:0]const u8 {
-            return getStrTabEntry(shstrtab, s.sh_name);
+        fn name(s: Shdr, obj: ElfObj) [:0]const u8 {
+            return getStrTabEntry(obj.getShStringTable(), s.sh_name);
         }
     };
 
@@ -654,6 +770,147 @@ const ElfObj = struct {
         }
     }
 
+    const Symbol = struct {
+        st_name: elf.Word,
+        st_info: u8,
+        st_other: u8,
+        st_shndx: Shdr.Ref,
+        st_value: elf.Elf64_Addr,
+        st_size: elf.Elf64_Xword,
+
+        pub inline fn st_type(sym: Symbol) u4 {
+            return @truncate(sym.st_info);
+        }
+        pub inline fn st_bind(sym: Symbol) u4 {
+            return @truncate(sym.st_info >> 4);
+        }
+    };
+
+    const SymtabSection = struct {
+        symbols: std.ArrayList(Symbol),
+        non_local_start_idx: usize,
+
+        fn read(
+            gpa: std.mem.Allocator,
+            header: elf.Header,
+            reader: *std.fs.File.Reader,
+            sh: Shdr,
+        ) !SymtabSection {
+            if (sh.sh_link == .undef) fatal("invalid symbol table section header: bad sh_link", .{});
+            const num_syms = sh.original_size / sh.sh_entsize;
+            if (sh.sh_info > num_syms) fatal("invalid symbol table section header: bad sh_info", .{});
+
+            var syms: std.ArrayList(Symbol) = try .initCapacity(gpa, num_syms);
+            errdefer syms.deinit(gpa);
+
+            try reader.seekTo(sh.original_offset);
+
+            for (0..num_syms) |i| switch (header.is_64) {
+                inline else => |is_64| {
+                    const sym = reader.interface.takeStruct(
+                        if (is_64) elf.Elf64_Sym else elf.Elf32_Sym,
+                        header.endian,
+                    ) catch |err| switch (err) {
+                        error.EndOfStream => fatal("invalid symbol table section: unexpected EOF", .{}),
+                        else => |e| return e,
+                    };
+
+                    const st_shndx: Shdr.Ref = @enumFromInt(sym.st_shndx);
+                    if (st_shndx == .xindex) fatal(
+                        "symbol [{d}] has st_shndx value 'SHN_XINDEX'. This feature is currently unsupported.",
+                        .{i},
+                    );
+
+                    syms.appendAssumeCapacity(.{
+                        .st_name = sym.st_name,
+                        .st_info = sym.st_info,
+                        .st_other = sym.st_other,
+                        .st_shndx = st_shndx,
+                        .st_value = sym.st_value,
+                        .st_size = sym.st_size,
+                    });
+                },
+            };
+
+            return .{
+                .symbols = syms,
+                .non_local_start_idx = sh.sh_info,
+            };
+        }
+    };
+
+    const GroupSection = struct {
+        flags: elf.Word,
+        sections: std.ArrayList(Shdr.Ref),
+
+        fn read(
+            arena: std.mem.Allocator,
+            header: elf.Header,
+            reader: *std.fs.File.Reader,
+            sh: Shdr,
+        ) !GroupSection {
+            const num_entries = sh.original_size / @sizeOf(elf.Word);
+            const section_refs = try arena.alloc(Shdr.Ref, num_entries - 1);
+            errdefer arena.free(section_refs);
+
+            try reader.seekTo(sh.original_offset);
+            const flags = try reader.interface.takeInt(elf.Word, header.endian);
+            for (section_refs) |*ref| {
+                ref.* = @enumFromInt(try reader.interface.takeInt(elf.Word, header.endian));
+            }
+
+            return .{ .flags = flags, .sections = .fromOwnedSlice(section_refs) };
+        }
+    };
+
+    // @Incomplete handle shifting indices when adding/removing symbols.
+    const Relocation = elf.Elf64_Rela;
+    const RelocationSection = struct {
+        // @Performance is there a smarter way of doing this that uses less memory?
+        /// Reading the `r_addend` field of relocation entries is illegal unless
+        /// this value is true.
+        addend: bool,
+        entries: std.ArrayList(Relocation),
+
+        fn read(
+            arena: std.mem.Allocator,
+            header: elf.Header,
+            reader: *std.fs.File.Reader,
+            sh: Shdr,
+        ) !RelocationSection {
+            const addend = sh.sh_type == elf.SHT_RELA;
+
+            const num_entries = sh.original_size / sh.sh_entsize;
+            var entries: std.ArrayList(Relocation) = try .initCapacity(arena, num_entries);
+            errdefer entries.deinit(arena);
+
+            try reader.seekTo(sh.original_offset);
+            for (0..num_entries) |_| switch (header.is_64) {
+                inline else => |is_64| {
+                    const RelT = if (is_64) elf.Elf64_Rela else elf.Elf32_Rela;
+
+                    const rel = entries.addOneAssumeCapacity();
+                    rel.r_offset = try reader.interface.takeInt(
+                        @FieldType(RelT, "r_offset"),
+                        header.endian,
+                    );
+                    rel.r_info = try reader.interface.takeInt(
+                        @FieldType(RelT, "r_info"),
+                        header.endian,
+                    );
+                    if (addend) {
+                        rel.r_addend = try reader.interface.takeInt(
+                            @FieldType(RelT, "r_addend"),
+                            header.endian,
+                        );
+                    }
+                },
+            };
+
+            return .{ .addend = addend, .entries = entries };
+        }
+    };
+
     pub fn format(obj: ElfObj, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         for (obj.shdr_table.items, 0..) |ref, i| {
             const section = ref.get(obj);
@@ -692,7 +949,7 @@ const ElfObj = struct {
 
             try writer.print(
                 "[{d: >2}] name: {s: <20}, type: {s: <13}, ",
-                .{ i, section.name(obj.shstrtab_buffer.items), sh_type },
+                .{ i, section.name(obj), sh_type },
             );
             {
                 try writer.writeAll("flags: ");
