@@ -101,7 +101,6 @@ pub fn main() !void {
     var input_reader = input_file.reader(&input_buffer);
 
     var elf_obj = try ElfObj.read(arena, &input_reader);
-    std.debug.print("{}\n", .{elf_obj.header});
 
     // Remove sections and any dead references:
     // create list of sections that should be removed
@@ -270,7 +269,7 @@ pub fn main() !void {
         const section = ref.get(elf_obj);
         for (opt_set_section_flags.items) |set_flags| {
             if (strEql(set_flags.section_name, section.name(elf_obj))) {
-                ElfObj.setSectionFlags(section, set_flags.flags, elf_obj.header.machine == .X86_64);
+                section.setFlags(set_flags.flags, elf_obj.header.machine == .X86_64);
             }
         }
     }
@@ -715,8 +714,9 @@ const ElfObj = struct {
                 return elf.SHN_LORESERVE <= i and i <= elf.SHN_HIRESERVE;
             }
 
+            /// This function is safe to call when `r == .undef`
+            /// and will return the `SHT_NULL` header.
             fn get(r: Ref, obj: ElfObj) *Shdr {
-                // It's fine if r == .undef since the null section is stored as well.
                 return &obj.shdr_buf.items[@intFromEnum(r)];
             }
         };
@@ -724,51 +724,51 @@ const ElfObj = struct {
         fn name(s: Shdr, obj: ElfObj) [:0]const u8 {
             return getStrTabEntry(obj.getShStringTable(), s.sh_name);
         }
+
+        pub fn setFlags(sh: *Shdr, flags: SectionFlags, is_x86_64: bool) void {
+            // For ELF objects, the flags have the following effects:
+            //     alloc = add the SHF_ALLOC flag.
+            //     load = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
+            //     readonly = if this flag is not specified, add the SHF_WRITE flag.
+            //     exclude = add the SHF_EXCLUDE flag.
+            //     code = add the SHF_EXECINSTR flag.
+            //     merge = add the SHF_MERGE flag.
+            //     strings = add the SHF_STRINGS flag.
+            //     contents = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
+            //     large = add the SHF_X86_64_LARGE on x86_64; rejected if the target architecture is not x86_64.
+            var new_flags: elf.Elf64_Xword = 0;
+            if (flags.alloc) new_flags |= elf.SHF_ALLOC;
+            if (!flags.readonly) new_flags |= elf.SHF_WRITE;
+            if (flags.code) new_flags |= elf.SHF_EXECINSTR;
+            if (flags.merge) new_flags |= elf.SHF_MERGE;
+            if (flags.strings) new_flags |= elf.SHF_STRINGS;
+            if (flags.exclude) new_flags |= elf.SHF_EXCLUDE;
+            if (flags.large) {
+                if (!is_x86_64) fatal(
+                    "zig objcopy: 'large' section flag is only supported on x86_64 targets",
+                    .{},
+                );
+                new_flags |= elf.SHF_X86_64_LARGE;
+            }
+
+            // LLVM preserves some flags when applying the new ones, including os/arch specific flags.
+            const preserve_mask: elf.Elf64_Xword =
+                (elf.SHF_INFO_LINK | elf.SHF_LINK_ORDER | elf.SHF_GROUP |
+                    elf.SHF_TLS | elf.SHF_COMPRESSED | elf.SHF_MASKOS |
+                    elf.SHF_MASKPROC)
+                // exclude and large overlap with some preserved flags and need to be masked out
+                & ~(elf.SHF_EXCLUDE | @as(elf.Elf64_Xword, if (is_x86_64) elf.SHF_X86_64_LARGE else 0));
+
+            sh.sh_flags = (sh.sh_flags & preserve_mask) | (new_flags & ~preserve_mask);
+
+            if (sh.sh_type == elf.SHT_NOBITS and (flags.load or flags.contents or
+                // LLVM also promotes non-ALLOC NOBITS sections since they're nonsensical.
+                sh.sh_flags & elf.SHF_ALLOC == 0))
+            {
+                sh.sh_type = elf.SHT_PROGBITS;
+            }
+        }
     };
-
-    pub fn setSectionFlags(sh: *Shdr, flags: SectionFlags, is_x86_64: bool) void {
-        // For ELF objects, the flags have the following effects:
-        //     alloc = add the SHF_ALLOC flag.
-        //     load = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
-        //     readonly = if this flag is not specified, add the SHF_WRITE flag.
-        //     exclude = add the SHF_EXCLUDE flag.
-        //     code = add the SHF_EXECINSTR flag.
-        //     merge = add the SHF_MERGE flag.
-        //     strings = add the SHF_STRINGS flag.
-        //     contents = if the section has SHT_NOBITS type, mark it as a SHT_PROGBITS section.
-        //     large = add the SHF_X86_64_LARGE on x86_64; rejected if the target architecture is not x86_64.
-        var new_flags: elf.Elf64_Xword = 0;
-        if (flags.alloc) new_flags |= elf.SHF_ALLOC;
-        if (!flags.readonly) new_flags |= elf.SHF_WRITE;
-        if (flags.code) new_flags |= elf.SHF_EXECINSTR;
-        if (flags.merge) new_flags |= elf.SHF_MERGE;
-        if (flags.strings) new_flags |= elf.SHF_STRINGS;
-        if (flags.exclude) new_flags |= elf.SHF_EXCLUDE;
-        if (flags.large) {
-            if (!is_x86_64) fatal(
-                "zig objcopy: 'large' section flag is only supported on x86_64 targets",
-                .{},
-            );
-            new_flags |= elf.SHF_X86_64_LARGE;
-        }
-
-        // LLVM preserves some flags when applying the new ones, including os/arch specific flags.
-        const preserve_mask: elf.Elf64_Xword =
-            (elf.SHF_INFO_LINK | elf.SHF_LINK_ORDER | elf.SHF_GROUP |
-                elf.SHF_TLS | elf.SHF_COMPRESSED | elf.SHF_MASKOS |
-                elf.SHF_MASKPROC)
-            // exclude and large overlap with some preserved flags and need to be masked out
-            & ~(elf.SHF_EXCLUDE | @as(elf.Elf64_Xword, if (is_x86_64) elf.SHF_X86_64_LARGE else 0));
-
-        sh.sh_flags = (sh.sh_flags & preserve_mask) | (new_flags & ~preserve_mask);
-
-        if (sh.sh_type == elf.SHT_NOBITS and (flags.load or flags.contents or
-            // LLVM also promotes non-ALLOC NOBITS sections since they're nonsensical.
-            sh.sh_flags & elf.SHF_ALLOC == 0))
-        {
-            sh.sh_type = elf.SHT_PROGBITS;
-        }
-    }
 
     const Symbol = struct {
         st_name: elf.Word,
@@ -912,8 +912,46 @@ const ElfObj = struct {
     };
 
     pub fn format(obj: ElfObj, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll("Elf Header:\n");
+        {
+            try writer.print(
+                \\  class:           {s}
+                \\  endian:          {t}
+                \\  os_abi:          {t}
+                \\  abi_version:     {d}
+                \\  type:            {t}
+                \\  machine:         {t}
+                \\  entry:           0x{x}
+                \\  phoff:           {d}
+                \\  shoff:           {d}
+                \\  phentsize:       {d}
+                \\  phnum:           {d}
+                \\  shentsize:       {d}
+                \\  shnum:           {d}
+                \\  shstrndx:        {d}
+            , .{
+                if (obj.header.is_64) "ELF64" else "ELF32",
+                obj.header.endian,
+                obj.header.os_abi,
+                obj.header.abi_version,
+                obj.header.type,
+                obj.header.machine,
+                obj.header.entry,
+                obj.header.phoff,
+                obj.header.shoff,
+                obj.header.phentsize,
+                obj.header.phnum,
+                obj.header.shentsize,
+                obj.header.shnum,
+                obj.header.shstrndx,
+            });
+        }
+
+        var symtab_shdr: ?*Shdr = null;
+        try writer.writeAll("\nSection Headers:\n");
         for (obj.shdr_table.items, 0..) |ref, i| {
             const section = ref.get(obj);
+            if (section.sh_type == elf.SHT_SYMTAB) symtab_shdr = section;
 
             const sh_type = switch (section.sh_type) {
                 elf.SHT_NULL => "NULL",
@@ -948,7 +986,7 @@ const ElfObj = struct {
             };
 
             try writer.print(
-                "[{d: >2}] name: {s: <20}, type: {s: <13}, ",
+                "  [{d: >2}] name: {s: <20}, type: {s: <13}, ",
                 .{ i, section.name(obj), sh_type },
             );
             {
@@ -1000,6 +1038,73 @@ const ElfObj = struct {
                 section.sh_addralign,
                 section.sh_entsize,
             });
+        }
+
+        if (symtab_shdr) |section| {
+            try writer.writeAll("\nSymbols:\n");
+
+            const symbols = section.contents.symtab.symbols.items;
+            const syms_to_print = symbols[0..@min(symbols.len, 80)];
+            for (syms_to_print) |sym| {
+                const st_name = getStrTabEntry(
+                    section.sh_link.get(obj).contents.strtab.items,
+                    sym.st_name,
+                );
+
+                const st_type = switch (sym.st_type()) {
+                    elf.STT_NOTYPE => "NOTYPE",
+                    elf.STT_OBJECT => "OBJECT",
+                    elf.STT_FUNC => "FUNC",
+                    elf.STT_SECTION => "SECTION",
+                    elf.STT_FILE => "FILE",
+                    elf.STT_COMMON => "COMMON",
+                    elf.STT_TLS => "TLS",
+                    elf.STT_NUM => "NUM",
+                    elf.STT_GNU_IFUNC => "GNU_IFUNC",
+                    elf.STT_SPARC_REGISTER => "SPARC_REGISTER/PARISC_MILLICODE/ARM_TFUNC",
+                    elf.STT_HP_OPAQUE => "HP_OPAQUE",
+                    elf.STT_HP_STUB => "HP_STUB",
+                    elf.STT_ARM_16BIT => "ARM_16BIT",
+                    else => |sh_type| switch (sh_type) {
+                        elf.STT_LOOS...elf.STT_HIOS => "OS_unknown",
+                        elf.STT_LOPROC...elf.STT_HIPROC => "PROC_unknown",
+                        else => "unknown",
+                    },
+                };
+
+                const st_bind = switch (sym.st_bind()) {
+                    elf.STB_LOCAL => "LOCAL",
+                    elf.STB_GLOBAL => "GLOBAL",
+                    elf.STB_WEAK => "WEAK",
+                    elf.STB_NUM => "NUM",
+                    elf.STB_GNU_UNIQUE => "GNU_UNIQUE",
+                    elf.STB_MIPS_SPLIT_COMMON => "MIPS_SPLIT_COMMON",
+                    else => |sh_type| switch (sh_type) {
+                        elf.STB_LOOS...elf.STB_HIOS => "OS_unknown",
+                        elf.STB_LOPROC...elf.STB_HIPROC => "PROC_unknown",
+                        else => "unknown",
+                    },
+                };
+
+                try writer.print("  name: {s: <31}, type: {s: <7}, bind: {s: <6}, " ++
+                    "other: {}, section: {s: <15}, value: 0x{x: <8}, size: {}\n", .{
+                    st_name,
+                    st_type,
+                    st_bind,
+                    sym.st_other,
+                    switch (sym.st_shndx) {
+                        .abs => "ABS",
+                        .common => "COMMON",
+                        .xindex => "XINDEX",
+                        else => sym.st_shndx.get(obj).name(obj),
+                    },
+                    sym.st_value,
+                    sym.st_size,
+                });
+            }
+
+            if (syms_to_print.len < symbols.len)
+                try writer.writeAll("... symbols truncated");
         }
     }
 };
