@@ -117,7 +117,7 @@ pub fn main() !void {
 
                     if (section.sh_type == elf.SHT_GROUP) {
                         // remove SHF_GROUP flag from group members
-                        for (section.contents.group.sections.items) |member_ref| {
+                        for (section.contents.group.items(elf_obj)) |member_ref| {
                             member_ref.get(elf_obj).sh_flags &= ~@as(elf.Elf64_Xword, elf.SHF_GROUP);
                         }
                     }
@@ -167,13 +167,13 @@ pub fn main() !void {
                 // remove dead sections from group
                 const group = &alive_section.contents.group;
                 var i: usize = 0;
-                while (i < group.sections.items.len) {
+                while (i < group.items(elf_obj).len) {
                     if (sliceContains(
                         ElfObj.Shdr.Ref,
                         elf_obj.removed_sections.items,
-                        group.sections.items[i],
+                        group.items(elf_obj)[i],
                     )) {
-                        _ = group.sections.swapRemove(i);
+                        _ = elf_obj.groups.orderedRemoveItem(group.index, @intCast(i));
                     } else i += 1;
                 }
             },
@@ -197,17 +197,17 @@ pub fn main() !void {
 
                 // check relocation entries for references to dead sections
                 const symtab_shdr = alive_section.sh_link.get(elf_obj);
-                for (alive_section.contents.relocs.entries.items) |rel| {
+                for (alive_section.contents.relocs.items(elf_obj)) |rel| {
                     const sym_idx = rel.r_sym();
                     if (sym_idx == 0) continue;
 
                     // @Incomplete this will break when symbols are added/removed.
-                    const symbol = symtab_shdr.contents.symtab.symbols.items[sym_idx];
+                    const symbol = symtab_shdr.contents.symtab.items(elf_obj)[sym_idx];
                     if (symbol.st_shndx.reserved()) continue;
 
                     if (S.isDeadLink(symbol.st_shndx, elf_obj)) |dead_section| {
                         const sym_name = ElfObj.getStrTabEntry(
-                            symtab_shdr.sh_link.get(elf_obj).contents.strtab.items,
+                            symtab_shdr.sh_link.get(elf_obj).contents.strtab.items(elf_obj),
                             symbol.st_name,
                         );
                         fatal("section '{s}' cannot be removed: ({s}+0x{x}) has relocation against symbol '{s}'", .{
@@ -335,6 +335,20 @@ const ElfObj = struct {
 
     removed_sections: std.ArrayList(Shdr.Ref),
 
+    // All section content types are allocated in top-level big lists that support stable references.
+    // Sections use these special references to index into the lists, potentially taking subslices.
+    // Might need a freelist, or store in-band? Idk.
+    // Should test performance (timing and peak RSS) before & after.
+    //
+    // @Todo Stable references for relocations and/or symbols
+    // I think stable references can be implemented using tombstone values.
+    // That way we don't have to store keys and layout/emitting code can easily
+    // reject dead items. (not as nice as removing from the list, but whatever...)
+    strings: MultiList(u8),
+    symbols: MultiList(Symbol),
+    groups: MultiList(Shdr.Ref),
+    relocations: MultiList(Relocation),
+
     shstrtab: Shdr.Ref,
 
     fn appendSection(obj: *ElfObj, arena: std.mem.Allocator, section: Shdr) !void {
@@ -357,6 +371,11 @@ const ElfObj = struct {
         const shdr_refs = try allocator.alloc(Shdr.Ref, header.shnum);
         errdefer allocator.free(shdr_refs);
 
+        var strings: MultiList(u8) = .empty;
+        var symbols: MultiList(Symbol) = .empty;
+        var groups: MultiList(Shdr.Ref) = .empty;
+        var relocs: MultiList(Relocation) = .empty;
+
         var i: usize = 0;
         var ph_iter = header.iterateProgramHeaders(file_reader);
         while (try ph_iter.next()) |ph| : (i += 1) phdrs[i] = ph;
@@ -377,28 +396,22 @@ const ElfObj = struct {
                 .sh_entsize = sh.sh_entsize,
                 .original_offset = sh.sh_offset,
                 .original_size = sh.sh_size,
-                .contents = .original,
+                .contents = switch (sh.sh_type) {
+                    elf.SHT_STRTAB => .{
+                        .strtab = try .read(allocator, file_reader, sh, &strings),
+                    },
+                    elf.SHT_SYMTAB, elf.SHT_DYNSYM => .{
+                        .symtab = try .read(allocator, file_reader, header, sh, &symbols),
+                    },
+                    elf.SHT_GROUP => .{
+                        .group = try .read(allocator, file_reader, header, sh, &groups),
+                    },
+                    elf.SHT_REL, elf.SHT_RELA => .{
+                        .relocs = try .read(allocator, file_reader, header, sh, &relocs),
+                    },
+                    else => .original,
+                },
             };
-
-            switch (sh.sh_type) {
-                elf.SHT_SYMTAB, elf.SHT_DYNSYM => shdrs[i].contents = .{
-                    .symtab = try .read(allocator, header, file_reader, shdrs[i]),
-                },
-                elf.SHT_STRTAB => {
-                    var w: std.Io.Writer.Allocating = try .initCapacity(allocator, shdrs[i].original_size);
-                    errdefer w.deinit();
-                    try file_reader.seekTo(shdrs[i].original_offset);
-                    try file_reader.interface.streamExact(&w.writer, shdrs[i].original_size);
-                    shdrs[i].contents = .{ .strtab = w.toArrayList() };
-                },
-                elf.SHT_REL, elf.SHT_RELA => shdrs[i].contents = .{
-                    .relocs = try .read(allocator, header, file_reader, shdrs[i]),
-                },
-                elf.SHT_GROUP => shdrs[i].contents = .{
-                    .group = try .read(allocator, header, file_reader, shdrs[i]),
-                },
-                else => {},
-            }
         }
         std.debug.assert(i == header.shnum);
 
@@ -409,6 +422,10 @@ const ElfObj = struct {
             .shdr_buf = .fromOwnedSlice(shdrs),
             .shstrtab = @enumFromInt(header.shstrndx),
             .removed_sections = .empty,
+            .strings = strings,
+            .symbols = symbols,
+            .groups = groups,
+            .relocations = relocs,
         };
     }
 
@@ -456,10 +473,10 @@ const ElfObj = struct {
                         const stat = try file.stat(); // @Todo cache this when adding the section?
                         break :size stat.size;
                     },
-                    .symtab => |symtab| break :size symtab.symbols.items.len * section.sh_entsize,
-                    .strtab => |strtab| break :size strtab.items.len,
-                    .relocs => |relocs| break :size relocs.entries.items.len * section.sh_entsize,
-                    .group => |group| break :size (group.sections.items.len + 1) * @sizeOf(elf.Word),
+                    .symtab => |symtab| break :size symtab.items(obj.*).len * section.sh_entsize,
+                    .strtab => |strtab| break :size strtab.items(obj.*).len,
+                    .relocs => |relocs| break :size relocs.items(obj.*).len * section.sh_entsize,
+                    .group => |group| break :size (group.items(obj.*).len + 1) * @sizeOf(elf.Word),
                 }
             };
             offset += section.final_size;
@@ -551,7 +568,7 @@ const ElfObj = struct {
                             _ = try output.interface.sendFileAll(&file_reader, .unlimited);
                         },
                         .symtab => |symtab| {
-                            for (symtab.symbols.items) |sym| {
+                            for (symtab.items(obj)) |sym| {
                                 const tgt_sym: if (is_64) elf.Elf64_Sym else elf.Elf32_Sym = .{
                                     .st_name = sym.st_name,
                                     .st_info = sym.st_info,
@@ -566,9 +583,9 @@ const ElfObj = struct {
                                 try output.interface.writeStruct(tgt_sym, obj.header.endian);
                             }
                         },
-                        .strtab => |strtab| try output.interface.writeAll(strtab.items),
+                        .strtab => |strtab| try output.interface.writeAll(strtab.items(obj)),
                         .relocs => |relocs| {
-                            for (relocs.entries.items) |rel| {
+                            for (relocs.items(obj)) |rel| {
                                 const RelT = if (is_64) elf.Elf64_Rela else elf.Elf32_Rela;
 
                                 try output.interface.writeInt(
@@ -592,7 +609,7 @@ const ElfObj = struct {
                         },
                         .group => |group| {
                             try output.interface.writeInt(elf.Word, group.flags, obj.header.endian);
-                            for (group.sections.items) |member_ref| {
+                            for (group.items(obj)) |member_ref| {
                                 try output.interface.writeInt(
                                     elf.Word,
                                     member_ref.get(obj).final_index,
@@ -629,21 +646,26 @@ const ElfObj = struct {
     }
 
     fn getShStringTable(obj: ElfObj) []const u8 {
-        return obj.shstrtab.get(obj).contents.strtab.items;
+        return obj.shstrtab.get(obj).contents.strtab.items(obj);
     }
 
     fn insertShString(
-        obj: ElfObj,
+        obj: *ElfObj,
         // @Todo ElfObj should probably have it's own allocator
         allocator: std.mem.Allocator,
         str: []const u8,
     ) !u32 {
-        const shstrtab_buffer = &obj.shstrtab.get(obj).contents.strtab;
-        try shstrtab_buffer.ensureUnusedCapacity(allocator, str.len + 1);
+        try obj.strings.list.ensureUnusedCapacity(allocator, str.len + 1);
 
-        const str_idx: u32 = @intCast(shstrtab_buffer.items.len);
-        shstrtab_buffer.appendSliceAssumeCapacity(str);
-        shstrtab_buffer.appendAssumeCapacity(0);
+        const shstrtab = obj.shstrtab.get(obj.*).contents.strtab;
+        const str_idx = obj.strings.sublist_lengths.items[shstrtab.index];
+        const item_idx = obj.strings.getSublistOffset(shstrtab.index) + str_idx;
+
+        const new_str = obj.strings.list.addManyAtAssumeCapacity(item_idx, str.len + 1);
+        obj.strings.sublist_lengths.items[shstrtab.index] += @intCast(str.len + 1);
+
+        @memcpy(new_str[0..str.len], str);
+        new_str[new_str.len - 1] = 0;
         return str_idx;
     }
 
@@ -664,17 +686,15 @@ const ElfObj = struct {
         sh_addralign: elf.Elf64_Xword,
         sh_entsize: elf.Elf64_Xword,
 
-        // @Incomplete store in PWP manner. Common types use shared pools (e.g. all strtabs are backed by one arraylist)
         contents: union(enum) {
             /// Untracked contents
             original,
             /// Use contents from a file
             file: std.fs.File,
-            // @Todo there can only be one section of each type, so they can be stored in ElfObj instead
             /// SHT_SYMTAB or SHT_DYNSYM
             symtab: SymtabSection,
             /// SHT_STRTAB
-            strtab: std.ArrayList(u8),
+            strtab: StrtabSection,
             /// SHT_REL or SHT_RELA
             relocs: RelocationSection,
             /// SHT_GROUP
@@ -770,6 +790,32 @@ const ElfObj = struct {
         }
     };
 
+    const StrtabSection = struct {
+        /// Index into `ElfObj.strings`.
+        index: u32,
+
+        fn read(
+            gpa: std.mem.Allocator,
+            reader: *std.fs.File.Reader,
+            sh: elf.Elf64_Shdr,
+            strings: *MultiList(u8),
+        ) !StrtabSection {
+            const size = sh.sh_size;
+            const index = try strings.addSublistWithUnusedCapacity(gpa, @intCast(size));
+
+            var w: std.Io.Writer.Allocating = .fromArrayList(gpa, &strings.list);
+            try reader.seekTo(sh.sh_offset);
+            try reader.interface.streamExact(&w.writer, size);
+            strings.list = w.toArrayList();
+
+            return .{ .index = index };
+        }
+
+        fn items(st: StrtabSection, obj: ElfObj) []u8 {
+            return obj.strings.items(st.index);
+        }
+    };
+
     const Symbol = struct {
         st_name: elf.Word,
         st_info: u8,
@@ -787,24 +833,24 @@ const ElfObj = struct {
     };
 
     const SymtabSection = struct {
-        symbols: std.ArrayList(Symbol),
-        non_local_start_idx: usize,
+        /// Index into `ElfObj.symbols`.
+        index: u32,
+        non_local_start_idx: u32,
 
         fn read(
             gpa: std.mem.Allocator,
-            header: elf.Header,
             reader: *std.fs.File.Reader,
-            sh: Shdr,
+            header: elf.Header,
+            sh: elf.Elf64_Shdr,
+            symbols: *MultiList(Symbol),
         ) !SymtabSection {
-            if (sh.sh_link == .undef) fatal("invalid symbol table section header: bad sh_link", .{});
-            const num_syms = sh.original_size / sh.sh_entsize;
+            if (sh.sh_link == elf.SHN_UNDEF) fatal("invalid symbol table section header: bad sh_link", .{});
+            const num_syms = sh.sh_size / sh.sh_entsize;
             if (sh.sh_info > num_syms) fatal("invalid symbol table section header: bad sh_info", .{});
 
-            var syms: std.ArrayList(Symbol) = try .initCapacity(gpa, num_syms);
-            errdefer syms.deinit(gpa);
+            const index = try symbols.addSublistWithUnusedCapacity(gpa, @intCast(num_syms));
 
-            try reader.seekTo(sh.original_offset);
-
+            try reader.seekTo(sh.sh_offset);
             for (0..num_syms) |i| switch (header.is_64) {
                 inline else => |is_64| {
                     const sym = reader.interface.takeStruct(
@@ -821,7 +867,7 @@ const ElfObj = struct {
                         .{i},
                     );
 
-                    syms.appendAssumeCapacity(.{
+                    symbols.list.appendAssumeCapacity(.{
                         .st_name = sym.st_name,
                         .st_info = sym.st_info,
                         .st_other = sym.st_other,
@@ -833,63 +879,76 @@ const ElfObj = struct {
             };
 
             return .{
-                .symbols = syms,
+                .index = index,
                 .non_local_start_idx = sh.sh_info,
             };
+        }
+
+        fn items(st: SymtabSection, obj: ElfObj) []Symbol {
+            return obj.symbols.items(st.index);
         }
     };
 
     const GroupSection = struct {
+        /// Index into `ElfObj.groups`.
+        index: u32,
         flags: elf.Word,
-        sections: std.ArrayList(Shdr.Ref),
 
         fn read(
             arena: std.mem.Allocator,
-            header: elf.Header,
             reader: *std.fs.File.Reader,
-            sh: Shdr,
+            header: elf.Header,
+            sh: elf.Elf64_Shdr,
+            groups: *MultiList(Shdr.Ref),
         ) !GroupSection {
-            const num_entries = sh.original_size / @sizeOf(elf.Word);
-            const section_refs = try arena.alloc(Shdr.Ref, num_entries - 1);
-            errdefer arena.free(section_refs);
+            const num_entries = (sh.sh_size / @sizeOf(elf.Word)) - 1;
+            const index = try groups.addSublistWithUnusedCapacity(arena, @intCast(num_entries));
 
-            try reader.seekTo(sh.original_offset);
+            try reader.seekTo(sh.sh_offset);
             const flags = try reader.interface.takeInt(elf.Word, header.endian);
-            for (section_refs) |*ref| {
-                ref.* = @enumFromInt(try reader.interface.takeInt(elf.Word, header.endian));
+            for (0..num_entries) |_| {
+                groups.list.appendAssumeCapacity(
+                    @enumFromInt(try reader.interface.takeInt(elf.Word, header.endian)),
+                );
             }
 
-            return .{ .flags = flags, .sections = .fromOwnedSlice(section_refs) };
+            return .{ .flags = flags, .index = index };
+        }
+
+        fn items(gs: GroupSection, obj: ElfObj) []Shdr.Ref {
+            return obj.groups.items(gs.index);
         }
     };
 
     // @Incomplete handle shifting indices when adding/removing symbols.
     const Relocation = elf.Elf64_Rela;
     const RelocationSection = struct {
+        /// Index into `ElfObj.relocations`.
+        index: u32,
+
         // @Performance is there a smarter way of doing this that uses less memory?
         /// Reading the `r_addend` field of relocation entries is illegal unless
         /// this value is true.
         addend: bool,
-        entries: std.ArrayList(Relocation),
 
         fn read(
             arena: std.mem.Allocator,
-            header: elf.Header,
             reader: *std.fs.File.Reader,
-            sh: Shdr,
+            header: elf.Header,
+            sh: elf.Elf64_Shdr,
+            relocs: *MultiList(Relocation),
         ) !RelocationSection {
             const addend = sh.sh_type == elf.SHT_RELA;
 
-            const num_entries = sh.original_size / sh.sh_entsize;
-            var entries: std.ArrayList(Relocation) = try .initCapacity(arena, num_entries);
-            errdefer entries.deinit(arena);
+            const num_entries = sh.sh_size / sh.sh_entsize;
+            const index = try relocs.addSublistWithUnusedCapacity(arena, @intCast(num_entries));
 
-            try reader.seekTo(sh.original_offset);
+            try reader.seekTo(sh.sh_offset);
             for (0..num_entries) |_| switch (header.is_64) {
                 inline else => |is_64| {
                     const RelT = if (is_64) elf.Elf64_Rela else elf.Elf32_Rela;
 
-                    const rel = entries.addOneAssumeCapacity();
+                    const rel = relocs.list.addOneAssumeCapacity();
                     rel.r_offset = try reader.interface.takeInt(
                         @FieldType(RelT, "r_offset"),
                         header.endian,
@@ -907,7 +966,11 @@ const ElfObj = struct {
                 },
             };
 
-            return .{ .addend = addend, .entries = entries };
+            return .{ .addend = addend, .index = index };
+        }
+
+        fn items(rs: RelocationSection, obj: ElfObj) []Relocation {
+            return obj.relocations.items(rs.index);
         }
     };
 
@@ -1028,7 +1091,7 @@ const ElfObj = struct {
                 try writer.writeAll(", ");
             }
 
-            try writer.print("addr: 0x{x: <6}, offset: 0x{x: <6}, size: {d: <8}, " ++
+            try writer.print("addr: 0x{x: <6}, offset: 0x{x: <6}, size: 0x{x: <8}, " ++
                 "link: {d: <4}, info: {d: <4}, addralign: {d: <4}, entsize: {d}\n", .{
                 section.sh_addr,
                 section.final_offset,
@@ -1043,11 +1106,11 @@ const ElfObj = struct {
         if (symtab_shdr) |section| {
             try writer.writeAll("\nSymbols:\n");
 
-            const symbols = section.contents.symtab.symbols.items;
+            const symbols = section.contents.symtab.items(obj);
             const syms_to_print = symbols[0..@min(symbols.len, 80)];
             for (syms_to_print) |sym| {
                 const st_name = getStrTabEntry(
-                    section.sh_link.get(obj).contents.strtab.items,
+                    section.sh_link.get(obj).contents.strtab.items(obj),
                     sym.st_name,
                 );
 
@@ -1143,4 +1206,83 @@ fn strEql(a: []const u8, b: []const u8) bool {
 
 fn sliceContains(comptime T: type, slice: []const T, needle: T) bool {
     return std.mem.indexOfScalar(T, slice, needle) != null;
+}
+
+/// Multiple lists of type `T` stored contiguously in memory.
+/// Each "sublist" is tracked by it's length in the `sublist_lengths` field.
+/// The same allocator must be used for both lists throughout their entire lifetime.
+fn MultiList(comptime T: type) type {
+    return struct {
+        list: std.ArrayList(T),
+        sublist_lengths: std.ArrayList(u32),
+
+        pub const empty: @This() = .{
+            .list = .empty,
+            .sublist_lengths = .empty,
+        };
+
+        pub fn appendItem(
+            self: *@This(),
+            gpa: std.mem.Allocator,
+            sublist_idx: u32,
+            item: T,
+        ) !void {
+            const item_idx = self.getSublistOffset(sublist_idx) + self.sublist_lengths.items[sublist_idx];
+            try self.list.insert(gpa, item_idx, item);
+            self.sublist_lengths.items[sublist_idx] += 1;
+        }
+
+        pub fn orderedRemoveItem(
+            self: *@This(),
+            sublist_idx: u32,
+            item_idx: u32,
+        ) T {
+            std.debug.assert(self.sublist_lengths.items[sublist_idx] > 0);
+
+            const offset = self.getSublistOffset(sublist_idx);
+            defer self.sublist_lengths.items[sublist_idx] -= 1;
+            return self.list.orderedRemove(offset + item_idx);
+        }
+
+        pub fn removeSublist(self: *@This(), index: u32) void {
+            std.debug.assert(index < self.sublist_lengths.items.len);
+            const offset = self.getSublistOffset(index);
+            const len = self.sublist_lengths.items[index];
+
+            if (index < self.sublist_lengths.items.len - 1) {
+                const after = self.list.items[offset..][0..len][0..];
+                @memmove(self.list.items[offset..][0..after.len], after);
+            }
+
+            self.list.shrinkRetainingCapacity(self.list.items.len - len);
+            _ = self.sublist_lengths.orderedRemove(index);
+        }
+
+        /// Returns the index for the added sublist.
+        fn addSublistWithUnusedCapacity(
+            self: *@This(),
+            gpa: std.mem.Allocator,
+            sublist_len: u32,
+        ) !u32 {
+            try self.sublist_lengths.append(gpa, sublist_len);
+            errdefer _ = self.sublist_lengths.pop();
+            try self.list.ensureUnusedCapacity(gpa, sublist_len);
+
+            return @intCast(self.sublist_lengths.items.len - 1);
+        }
+
+        pub fn items(self: @This(), sublist_idx: u32) []T {
+            const offset = self.getSublistOffset(sublist_idx);
+            const len = self.sublist_lengths.items[sublist_idx];
+            return self.list.items[offset..][0..len];
+        }
+
+        pub fn getSublistOffset(self: @This(), index: u32) usize {
+            var offset: usize = 0;
+            for (self.sublist_lengths.items[0..index]) |len| {
+                offset += len;
+            }
+            return offset;
+        }
+    };
 }
